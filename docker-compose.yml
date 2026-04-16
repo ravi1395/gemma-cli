@@ -1,0 +1,40 @@
+version: "3.8"
+
+# Redis backing store for the gemma-cli memory system.
+#
+#   docker compose up -d    # start in background
+#   docker compose down     # stop (data persists in the named volume)
+#   docker compose down -v  # stop AND wipe all memory data
+#
+# Configuration rationale:
+#   - maxmemory 256mb keeps Redis well below the 16GB unified-memory budget
+#     on M-series Macs, leaving ample room for Gemma + the embedding model.
+#   - allkeys-lru evicts least-recently-used keys first when full; this is
+#     what we want because low-importance / unused memories should die first.
+#   - appendonly yes enables AOF persistence so data survives container restarts.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gemma-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - gemma_redis_data:/data
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  gemma_redis_data:

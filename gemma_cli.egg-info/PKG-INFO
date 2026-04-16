@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: gemma-cli
+Version: 0.1.0
+Summary: Local CLI for Google's Gemma 4 model via Ollama, with Redis-backed recursive memory.
+Requires-Python: >=3.10
+Requires-Dist: typer>=0.12
+Requires-Dist: ollama>=0.5
+Requires-Dist: rich>=13.7
+Provides-Extra: memory
+Requires-Dist: redis>=5.0; extra == "memory"
+Requires-Dist: numpy>=1.24; extra == "memory"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: fakeredis>=2.20; extra == "dev"
