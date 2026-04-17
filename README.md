@@ -18,10 +18,12 @@ A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backe
 - [Scaling to larger Gemma models](#scaling-to-larger-gemma-models)
 - [Installation](#installation)
   - [Quick setup (recommended)](#quick-setup-recommended)
+  - [Quick setup — Windows](#quick-setup--windows)
   - [Manual setup](#manual-setup)
 - [Running Redis](#running-redis)
   - [Native (macOS)](#native-macos)
   - [Native (Linux)](#native-linux)
+  - [Native (Windows)](#native-windows)
   - [Docker (optional)](#docker-optional)
 - [CLI Usage](#cli-usage)
   - [ask](#ask)
@@ -335,35 +337,69 @@ chmod +x setup.sh
 
 Re-running is safe — every step is idempotent and skips work already done.
 
+### Quick setup — Windows
+
+`setup.ps1` is the PowerShell equivalent for Windows. It uses `winget` or Chocolatey to install missing dependencies.
+
+```powershell
+git clone <repo-url> gemma-cli
+cd gemma-cli
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\setup.ps1
+```
+
+**What the script does:**
+1. Installs Python ≥ 3.10 if missing (via `winget` or `choco`)
+2. Creates and activates a `.venv` virtual environment
+3. Installs gemma-cli with all dependencies
+4. Ensures Redis is running — installs via `winget`/Chocolatey or [Memurai](https://www.memurai.com/) (Redis-compatible for Windows); falls back to Docker if already available
+5. Installs Ollama if missing (via `winget` or `choco`)
+6. Pulls `gemma4:e4b` and `nomic-embed-text` into Ollama
+7. Runs the full test suite
+
+```powershell
+# Skip model pulls
+.\setup.ps1 -SkipModels
+
+# Skip tests
+.\setup.ps1 -SkipTests
+```
+
 ### Manual setup
 
 **Prerequisites:** Python ≥ 3.10, [Ollama](https://ollama.com) installed and running, Redis (native or Docker).
 
+**macOS / Linux:**
 ```bash
-# 1. Clone and create a virtual environment
 git clone <repo-url> gemma-cli
 cd gemma-cli
 python -m venv .venv
 source .venv/bin/activate
-
-# 2. Install the package with memory dependencies
 pip install -e ".[memory]"
+ollama pull gemma4:e4b
+ollama pull nomic-embed-text
+```
 
-# 3. Pull the models into Ollama
-ollama pull gemma4:e4b          # ~3–4 GB — the main chat model
-ollama pull nomic-embed-text    # ~274 MB — the embedding model
+**Windows (PowerShell):**
+```powershell
+git clone <repo-url> gemma-cli
+cd gemma-cli
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[memory]"
+ollama pull gemma4:e4b
+ollama pull nomic-embed-text
 ```
 
 ---
 
 ## Running Redis
 
-`setup.sh` starts Redis automatically. If you are managing it manually, use whichever approach matches your setup.
+The setup scripts start Redis automatically. If you are managing it manually, use whichever approach matches your setup.
 
 ### Native (macOS)
 
 ```bash
-# Install and start
 brew install redis
 brew services start redis
 
@@ -374,11 +410,11 @@ brew services stop redis
 ### Native (Linux)
 
 ```bash
-# Install and start (Debian/Ubuntu)
+# Debian/Ubuntu
 sudo apt-get install redis-server
 sudo systemctl enable --now redis-server
 
-# Install and start (Fedora/RHEL)
+# Fedora/RHEL
 sudo dnf install redis
 sudo systemctl enable --now redis
 
@@ -386,6 +422,30 @@ sudo systemctl enable --now redis
 sudo systemctl stop redis-server   # Debian/Ubuntu
 sudo systemctl stop redis          # Fedora/RHEL
 ```
+
+### Native (Windows)
+
+There is no official Redis server for Windows. Two options:
+
+**Option A — [tporadowski/redis](https://github.com/tporadowski/redis/releases)** (community Windows port):
+```powershell
+winget install Redis.Redis
+# Starts as a Windows service automatically
+
+# Stop
+Stop-Service redis
+```
+
+**Option B — [Memurai](https://www.memurai.com/)** (Redis-compatible, native Windows):
+```powershell
+winget install Memurai.MemuraiDeveloper
+# Runs as a service on port 6379
+
+# Stop
+Stop-Service memurai
+```
+
+`setup.ps1` tries both automatically via `winget` or Chocolatey.
 
 ### Docker (optional)
 
