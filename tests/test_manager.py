@@ -236,3 +236,44 @@ def test_clear_session_empties_window_but_keeps_memories(store, cfg, sample_memo
     assert store.get_turn_count("test-session") == 0
     # Condensed memories survive
     assert store.count_active_memories() == len(sample_memories)
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction on recorded turns
+# ---------------------------------------------------------------------------
+
+def test_record_turn_redacts_secrets_in_redis_path(store, cfg):
+    """Turns pushed to Redis must never contain raw secrets."""
+    mgr = _build_manager(store, cfg)
+    secret_aws = "AKIAIOSFODNN7EXAMPLE"
+    secret_gh = "ghp_" + "a" * 36
+    content = f"creds: {secret_aws} and {secret_gh}"
+
+    mgr.record_turn("user", content)
+
+    stored = store.get_recent_turns("test-session", 10)
+    assert len(stored) == 1
+    assert secret_aws not in stored[0].content
+    assert secret_gh not in stored[0].content
+    assert "[REDACTED:AWS_ACCESS_KEY]" in stored[0].content
+    assert "[REDACTED:GITHUB_TOKEN]" in stored[0].content
+
+
+def test_record_turn_redacts_in_degraded_fallback(store, cfg):
+    """Fallback in-memory turns must also be scrubbed."""
+    cfg.memory_enabled = False
+    mgr = _build_manager(store, cfg)
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    mgr.record_turn("user", f"token {secret}")
+
+    messages = mgr.get_context_messages("q", system_prompt="sys")
+    joined = " ".join(m["content"] for m in messages)
+    assert secret not in joined
+    assert "[REDACTED:AWS_ACCESS_KEY]" in joined
+
+
+def test_record_turn_passthrough_on_clean_content(store, cfg):
+    mgr = _build_manager(store, cfg)
+    mgr.record_turn("user", "nothing sensitive here")
+    stored = store.get_recent_turns("test-session", 10)
+    assert stored[0].content == "nothing sensitive here"

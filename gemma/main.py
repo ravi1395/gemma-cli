@@ -1,10 +1,23 @@
 """Typer CLI entry point for gemma-cli.
 
-Four subcommands:
-  - ask       Single-shot query (with optional memory)
-  - chat      Interactive REPL with persistent memory + sliding window
-  - pipe      Stateless: read input from stdin (no memory)
-  - history   Inspect session, list condensed memories, show stats
+Subcommands
+-----------
+Core:
+  ask             Single-shot query (with optional memory)
+  chat            Interactive REPL with persistent memory + sliding window
+  pipe            Stateless: read input from stdin (no memory)
+  history         Inspect session, list condensed memories, show stats
+
+Terminal-assistant:
+  sh              Translate natural language to a shell command
+  explain         Explain text, a file, a command, or an error
+  commit          Generate a conventional-commit message from staged changes
+  diff            Plain-English summary of git diff output
+  why             Explain why the last shell command failed
+  install-shell   Print/append the shell hook snippet for ``why``
+
+All terminal-assistant commands are stateless by default (no memory read/write)
+and behave correctly when stdout is not a TTY (pipe-safe).
 """
 
 from __future__ import annotations
@@ -18,6 +31,13 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from gemma.client import chat as client_chat
+from gemma.commands.explain import explain_command
+from gemma.commands.git import commit_command, diff_command
+from gemma.commands.shell import (
+    install_shell_command,
+    sh_command,
+    why_command,
+)
 from gemma.config import Config
 from gemma.history import SessionHistory
 from gemma.memory import MemoryManager
@@ -26,6 +46,14 @@ from gemma.memory import MemoryManager
 app = typer.Typer(help="Local CLI for Google's Gemma 4 model via Ollama.")
 history_app = typer.Typer(help="Manage history, memories, and stats.")
 app.add_typer(history_app, name="history")
+
+# Terminal-assistant commands (stateless, developer-workflow focused)
+app.command("sh")(sh_command)
+app.command("explain")(explain_command)
+app.command("commit")(commit_command)
+app.command("diff")(diff_command)
+app.command("why")(why_command)
+app.command("install-shell")(install_shell_command)
 
 console = Console()
 
@@ -39,6 +67,7 @@ def _make_config(
     system: Optional[str] = None,
     memory_enabled: bool = True,
     thinking_mode: bool = False,
+    keep_alive: Optional[str] = None,
 ) -> Config:
     """Build a Config, applying optional CLI overrides."""
     cfg = Config()
@@ -48,6 +77,8 @@ def _make_config(
         cfg.system_prompt = system
     cfg.memory_enabled = memory_enabled
     cfg.thinking_mode = thinking_mode
+    if keep_alive:
+        cfg.ollama_keep_alive = keep_alive
     return cfg
 
 
@@ -112,9 +143,16 @@ def ask(
     no_stream: bool = typer.Option(False, "--no-stream"),
     no_memory: bool = typer.Option(False, "--no-memory", help="Skip memory retrieval."),
     think: bool = typer.Option(False, "--think", help="Enable Gemma 4 extended thinking mode."),
+    keep_alive: Optional[str] = typer.Option(
+        None, "--keep-alive",
+        help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",
+    ),
 ) -> None:
     """Send a one-off prompt. Retrieves relevant memories unless --no-memory."""
-    cfg = _make_config(model=model, system=system, memory_enabled=not no_memory, thinking_mode=think)
+    cfg = _make_config(
+        model=model, system=system, memory_enabled=not no_memory,
+        thinking_mode=think, keep_alive=keep_alive,
+    )
     memory = _init_memory(cfg) if cfg.memory_enabled else None
 
     if memory is not None and memory.available:
@@ -144,9 +182,16 @@ def chat(
     fresh: bool = typer.Option(False, "--fresh", help="Start with an empty sliding window."),
     no_memory: bool = typer.Option(False, "--no-memory", help="Disable all memory features."),
     think: bool = typer.Option(False, "--think", help="Enable Gemma 4 extended thinking mode."),
+    keep_alive: Optional[str] = typer.Option(
+        None, "--keep-alive",
+        help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",
+    ),
 ) -> None:
     """Interactive chat REPL with memory-augmented context."""
-    cfg = _make_config(model=model, system=system, memory_enabled=not no_memory, thinking_mode=think)
+    cfg = _make_config(
+        model=model, system=system, memory_enabled=not no_memory,
+        thinking_mode=think, keep_alive=keep_alive,
+    )
     memory = _init_memory(cfg)
 
     if fresh:

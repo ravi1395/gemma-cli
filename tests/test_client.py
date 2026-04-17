@@ -142,3 +142,16 @@ def test_thinking_mode_off_by_default(mock_client_cls, config):
     list(ask("hello", config, stream=True))
 
     assert mock_inst.chat.call_args.kwargs["think"] is False
+
+
+@patch("gemma.client.ollama.Client")
+def test_keep_alive_propagated(mock_client_cls, config):
+    """The configured ollama_keep_alive is forwarded to ollama.Client.chat."""
+    config.ollama_keep_alive = "2h"
+    mock_inst = MagicMock()
+    mock_inst.chat.return_value = _fake_stream(["ok"])
+    mock_client_cls.return_value = mock_inst
+
+    list(ask("hi", config, stream=True))
+
+    assert mock_inst.chat.call_args.kwargs["keep_alive"] == "2h"

@@ -32,7 +32,15 @@ A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backe
   - [chat](#chat)
   - [pipe](#pipe)
   - [history](#history)
+- [Terminal-assistant commands](#terminal-assistant-commands)
+  - [sh](#sh)
+  - [explain](#explain)
+  - [commit](#commit)
+  - [diff](#diff)
+  - [why](#why)
+  - [install-shell](#install-shell)
 - [Configuration reference](#configuration-reference)
+- [Secret redaction](#secret-redaction)
 - [Graceful degradation](#graceful-degradation)
 - [Running tests](#running-tests)
 
@@ -210,11 +218,17 @@ RedisSearch requires the `redis-stack` image (a heavier derivative). The full si
 ```
 gemma-cli/
 ├── gemma/
-│   ├── main.py            CLI entry point — ask, chat, pipe, history subcommands
+│   ├── main.py            CLI entry point — all subcommands registered here
 │   ├── client.py          Ollama API wrapper (streaming + blocking)
-│   ├── history.py         JSON fallback session history (~/.gemma_history.json)
 │   ├── config.py          Config dataclass with all tunable parameters
 │   ├── embeddings.py      nomic-embed-text wrapper (Embedder class)
+│   ├── history.py         JSON fallback session history (~/.gemma_history.json)
+│   ├── redaction.py       Secret-pattern redaction (AWS keys, tokens, JWTs, …)
+│   ├── commands/
+│   │   ├── __init__.py    Package init
+│   │   ├── shell.py       sh, why, install-shell commands
+│   │   ├── explain.py     explain command (file / stdin / --cmd / --error)
+│   │   └── git.py         commit, diff commands
 │   └── memory/
 │       ├── __init__.py    Package exports
 │       ├── models.py      ConversationTurn, MemoryRecord, MemoryCategory
@@ -227,12 +241,16 @@ gemma-cli/
 │   ├── conftest.py        Shared fixtures (fakeredis, sample data)
 │   ├── test_client.py
 │   ├── test_history.py
+│   ├── test_redaction.py
 │   ├── test_memory_models.py
 │   ├── test_condensation.py
 │   ├── test_store.py
 │   ├── test_retrieval.py
 │   ├── test_context.py
-│   └── test_manager.py
+│   ├── test_manager.py
+│   ├── test_cmd_shell.py
+│   ├── test_cmd_explain.py
+│   └── test_cmd_git.py
 ├── docker-compose.yml     Redis 7 Alpine (256MB, LRU, AOF persistence)
 └── pyproject.toml
 ```
@@ -494,6 +512,9 @@ gemma ask "Write a poem" --no-stream
 
 # Skip memory retrieval (still prints a response, just no context injection)
 gemma ask "Quick question" --no-memory
+
+# Keep the model loaded for 2 hours (faster cold start on repeat calls)
+gemma ask "What did we decide about the auth layer?" --keep-alive 2h
 ```
 
 | Flag | Default | Description |
@@ -503,6 +524,7 @@ gemma ask "Quick question" --no-memory
 | `--no-stream` | off | Collect the full response, then render as Markdown |
 | `--no-memory` | off | Skip memory retrieval and recording |
 | `--think` | off | Enable Gemma 4 extended thinking mode |
+| `--keep-alive` | `30m` | How long Ollama keeps the model in RAM after this call (`"2h"`, `"-1"` to pin, `"0"` to evict) |
 
 ---
 
@@ -524,6 +546,9 @@ gemma chat --no-memory
 
 # Use a specific model
 gemma chat --model gemma3:8b
+
+# Pin the model in RAM for a long session (no eviction between turns)
+gemma chat --keep-alive -1
 ```
 
 Type `exit`, `quit`, or `:q` (or press `Ctrl-D`) to quit.
@@ -543,6 +568,7 @@ Memory mode will show `degraded mode` if Redis is unreachable, and the CLI will 
 | `--fresh` | off | Clear the raw sliding window before starting (condensed memories are kept) |
 | `--no-memory` | off | Disable all memory features |
 | `--think` | off | Enable Gemma 4 extended thinking mode |
+| `--keep-alive` | `30m` | How long Ollama keeps the model in RAM between turns (`"2h"`, `"-1"` to pin, `"0"` to evict) |
 
 ---
 
@@ -634,6 +660,218 @@ by importance:
 
 ---
 
+## Terminal-assistant commands
+
+These six commands are **stateless by default** (no memory read or write) and designed to fit naturally into shell workflows. They all accept `--model` and `--keep-alive` overrides and behave correctly when stdout is not a TTY.
+
+---
+
+### sh
+
+Translate a natural-language description into a single shell command.
+
+```bash
+# Print only — safe for piping or copying
+gemma sh --no-exec "find all Python files modified in the last 24 hours"
+
+# Interactive: shows the command in a panel, then asks "Run this? [y/N]"
+gemma sh "list the 10 largest files in the current directory"
+
+# Ask for an explanation comment above the command
+gemma sh --no-exec --explain "compress all PNG files in ./img"
+
+# Target a specific shell syntax
+gemma sh --no-exec --shell zsh "set a local variable and echo it"
+
+# Keep the model warm across repeated calls
+gemma sh --no-exec --keep-alive 2h "show listening ports"
+```
+
+The command is generated at `temperature=0.2` to minimise hallucination. A small safety blocklist rejects patterns like `rm -rf /`, `mkfs`, `dd if=`, and the fork bomb `:(){:|:&};:` — the command is printed but never executed if it matches.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--no-exec` | off | Print the command only; never prompt to run |
+| `--shell` | `$SHELL` | Target shell syntax: `bash`, `zsh`, `sh` |
+| `--explain` | off | Prepend a `#` comment describing what the command does |
+| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--keep-alive` | `30m` | Ollama model-residency duration |
+
+---
+
+### explain
+
+Explain text, a file, a shell command, or an error message in plain English.
+
+Input source is auto-detected (priority: file argument > `--cmd` > `--error` > stdin):
+
+```bash
+# Explain a file
+gemma explain error.log
+gemma explain main.py --lines 40        # first 40 lines only
+
+# Explain a shell command (never executed)
+gemma explain --cmd "find . -name '*.py' -mtime -1 -exec grep -l TODO {} +"
+
+# Explain an error message
+gemma explain --error "EACCES: permission denied, open '/etc/hosts'"
+
+# Pipe in a stack trace
+cat traceback.txt | gemma explain
+
+# Opt into memory retrieval for repo-aware context
+gemma explain --cmd "git rebase -i HEAD~5" --with-memory
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cmd` | — | Shell command to explain (not executed) |
+| `--error` | — | Error string or exception message to explain |
+| `--lines`, `-n` | all (≤20 KB) | For file mode: read only the first N lines |
+| `--with-memory` | off | Retrieve relevant Redis context before answering |
+| `--no-stream` | off | Collect then render as Markdown |
+| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--keep-alive` | `30m` | Ollama model-residency duration |
+
+---
+
+### commit
+
+Generate a [conventional-commits](https://www.conventionalcommits.org/) message from staged changes.
+
+```bash
+# Stage some changes first, then generate a message for review
+git add src/auth.py tests/test_auth.py
+gemma commit
+
+# Create the commit automatically
+gemma commit --apply
+
+# Force the commit type
+gemma commit --apply --type feat
+
+# Diffs larger than 20 KB are truncated automatically with a warning
+gemma commit --apply
+```
+
+The message is generated at `temperature=0.2`. Output format:
+
+```
+<type>(<scope>): <subject>
+
+<optional body>
+```
+
+Without `--apply` the message is printed for review and you can copy it manually. With `--apply`, `git commit -m <subject> [-m <body>]` is run directly.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--apply` | off | Create the commit after generating the message |
+| `--type` | (model decides) | Force a conventional-commit type: `feat`, `fix`, `chore`, `docs`, … |
+| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--keep-alive` | `30m` | Ollama model-residency duration |
+
+> **Note:** if `commit.gpgsign = true` is set in your git config, `git commit` will invoke your signing key as normal. `gemma commit` does not bypass signing.
+
+---
+
+### diff
+
+Summarize `git diff` output in plain English.
+
+```bash
+# Summarize unstaged working-tree changes (per file)
+gemma diff
+
+# Summarize staged changes
+gemma diff --staged
+
+# Summarize changes against a specific ref
+gemma diff HEAD~3
+gemma diff main..feature/new-auth
+
+# One-paragraph summary of the whole diff instead of per-file
+gemma diff --overall
+gemma diff HEAD~1 --overall
+```
+
+Per-file output (default) looks like:
+
+```
+src/auth.py — extracts JWT validation into a standalone helper function.
+tests/test_auth.py — adds three unit tests covering the new JWT helper.
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--staged` / `--cached` | off | Diff the staging area instead of the working tree |
+| `--overall` | off | One prose paragraph instead of per-file summaries |
+| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--keep-alive` | `30m` | Ollama model-residency duration |
+
+---
+
+### why
+
+Explain why the last shell command failed.  Requires `install-shell` to have
+been run and sourced at least once.
+
+```bash
+# After a command fails, just run:
+gemma why
+```
+
+`why` reads `$GEMMA_LAST_FILE` (default `~/.gemma_last_cmd`), which the shell hook
+writes after every prompt.  The file contains the exit code and the command that
+was run.  Gemma explains the most likely cause and suggests a concrete fix.
+
+```bash
+# Override the last-command file path (useful for testing)
+gemma why --last-file /tmp/my_last_cmd
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--last-file` | `~/.gemma_last_cmd` | Path to the last-command record (also read from `$GEMMA_LAST_FILE`) |
+| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--keep-alive` | `30m` | Ollama model-residency duration |
+
+---
+
+### install-shell
+
+Print (or append) a shell hook that records the last command and its exit code
+after every prompt, enabling `gemma why`.
+
+```bash
+# Print the bash snippet — source it manually
+gemma install-shell --shell bash
+
+# Print the zsh snippet
+gemma install-shell --shell zsh
+
+# Append directly to your rc file (backs up the original first)
+gemma install-shell --shell bash --append ~/.bashrc
+gemma install-shell --shell zsh  --append ~/.zshrc
+
+# After appending, reload your shell
+source ~/.bashrc   # or ~/.zshrc
+```
+
+The snippet sets `$GEMMA_LAST_FILE` and installs a hook (`PROMPT_COMMAND` for
+bash, `add-zsh-hook precmd` for zsh) that writes `<exit_code>\t<command>` to
+that file after every command.
+
+A backup of the original rc file is created at `<rc_file>.gemma-backup` before
+any modification.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--shell` | `$SHELL` | Target shell: `bash` or `zsh` |
+| `--append` | — | Append the snippet to this rc file path |
+
+---
+
 ## Configuration reference
 
 All settings live in `gemma/config.py` as a plain dataclass. CLI flags override individual values at runtime; there is no config file — edit the dataclass defaults or subclass `Config` to change persistent behaviour.
@@ -648,6 +886,7 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 | `ollama_host` | `http://localhost:11434` | Ollama server base URL |
 | `memory_enabled` | `True` | Master switch; set `False` to disable all Redis/embedding features |
 | `thinking_mode` | `False` | Enable Gemma 4 extended thinking; the model reasons step-by-step before responding |
+| `ollama_keep_alive` | `"30m"` | How long Ollama keeps the model loaded in RAM between calls. Accepts duration strings (`"30m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
 | `redis_url` | `redis://localhost:6379/0` | Redis connection string |
 | `embedding_model` | `nomic-embed-text` | Ollama model used for 768-dim embeddings |
 | `sliding_window_size` | `8` | Number of raw turns kept in the Redis list |
@@ -657,6 +896,49 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 | `memory_max_count` | `200` | Total active memories before reconsolidation is triggered |
 | `condensation_async` | `True` | Run condensation in a background thread (non-blocking) |
 | `ttl_map` | See table above | Per-importance TTL seconds; `None` = no expiry |
+
+---
+
+## Secret redaction
+
+Developers routinely paste configuration snippets, stack traces, and log files into the CLI.  Any of those inputs might contain credentials.  Once a turn is condensed into a Redis `MemoryRecord` it can persist for days — so gemma-cli scrubs secrets out of every turn **before** it reaches the store.
+
+### How it works
+
+Redaction runs automatically inside `MemoryManager.record_turn()` on every `ask` and `chat` turn, both the user message and the model reply.  It is transparent: the conversation continues normally, and the model still sees that a value was present (the redaction marker preserves context), just not what the value was.
+
+Terminal-assistant commands (`sh`, `explain`, `commit`, `diff`, `why`) are stateless and never write to Redis, so redaction does not apply to them.
+
+### Replacement format
+
+Each matched secret is replaced with a `[REDACTED:TYPE]` marker.  Structural context that helps with debugging is preserved:
+
+| Input | After redaction |
+|---|---|
+| `AKIAIOSFODNN7EXAMPLE` | `[REDACTED:AWS_ACCESS_KEY]` |
+| `Authorization: Bearer eyJhbGci…` | `Authorization: Bearer [REDACTED:BEARER_TOKEN]` |
+| `GITHUB_TOKEN=ghp_abc123…` | `GITHUB_TOKEN=[REDACTED:ENV_SECRET]` |
+| `-----BEGIN RSA PRIVATE KEY-----…` | `[REDACTED:PRIVATE_KEY]` |
+
+### Patterns covered
+
+| Type label | What it matches |
+|---|---|
+| `PRIVATE_KEY` | PEM private-key blocks (`BEGIN RSA/OPENSSH/EC/DSA/PRIVATE KEY … END …`) |
+| `BEARER_TOKEN` | `Authorization: Bearer <token>` — any token ≥ 20 chars |
+| `ENV_SECRET` | `.env`-style lines whose key name contains `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PWD`, `APIKEY`, `API_KEY`, `ACCESS_KEY`, or `PRIVATE_KEY` |
+| `AWS_ACCESS_KEY` | AWS access key IDs starting with `AKIA` or `ASIA` (20 chars) |
+| `GITHUB_TOKEN` | GitHub personal / OAuth / server-to-server tokens (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`) |
+| `GITLAB_TOKEN` | GitLab personal access tokens (`glpat-…`) |
+| `JWT` | Three-segment base64url strings matching the `eyJ…eyJ…` JWT header structure |
+
+### Logging
+
+When redaction fires, an `INFO`-level log entry records how many secrets were found and their types (e.g. `Redacted 2 secret(s) from user turn: types={'AWS_ACCESS_KEY', 'JWT'}`).  The raw matched strings are never logged or persisted — only the type labels are recorded.
+
+### Scope and limitations
+
+This is not a comprehensive DLP system.  It targets a small set of high-confidence structural patterns where false positives are rare.  False negatives are possible for credentials that do not match any of the patterns above (e.g. short random API keys with no known prefix, database connection strings).  It is a safety net, not a substitute for not pasting production credentials into a CLI tool.
 
 ---
 
@@ -678,21 +960,38 @@ You can always start with `gemma chat --no-memory` and add infrastructure later 
 
 ## Running tests
 
-Tests use `fakeredis` — no live Redis or Ollama instance is required.
+Tests use `fakeredis` and `typer.testing.CliRunner` — no live Redis or Ollama instance is required.  The git command tests (`test_cmd_git.py`) create throwaway repositories in `tmp_path` via subprocess and require `git` to be installed.
 
 ```bash
 # Install dev dependencies
 pip install -e ".[memory,dev]"
 
-# Run the full test suite
+# Run the full test suite (181 tests)
 pytest tests/ -v
 
-# Run a specific module
-pytest tests/test_manager.py -v
-pytest tests/test_context.py -v
+# Run specific modules
+pytest tests/test_manager.py -v         # memory orchestration
+pytest tests/test_cmd_shell.py -v       # sh / why / install-shell
+pytest tests/test_cmd_explain.py -v     # explain
+pytest tests/test_cmd_git.py -v         # commit / diff
+pytest tests/test_redaction.py -v       # secret redaction
 ```
 
-The suite covers: models, store CRUD, retrieval cosine math, context assembly + budget trimming, condensation prompt parsing, and MemoryManager orchestration (sliding window, condensation trigger, degraded mode, stats).
+The suite covers:
+
+| Area | Module |
+|---|---|
+| Secret redaction (7 pattern types) | `test_redaction.py` |
+| Ollama client + keep-alive propagation | `test_client.py` |
+| Redis store CRUD + embeddings | `test_store.py` |
+| Cosine similarity retrieval | `test_retrieval.py` |
+| Context assembly + token budget | `test_context.py` |
+| Condensation prompt parsing | `test_condensation.py` |
+| MemoryManager orchestration | `test_manager.py` |
+| `gemma sh` / `gemma why` / `gemma install-shell` | `test_cmd_shell.py` |
+| `gemma explain` (all input modes) | `test_cmd_explain.py` |
+| `gemma commit` / `gemma diff` | `test_cmd_git.py` |
+| JSON fallback history | `test_history.py` |
 
 ## License
 

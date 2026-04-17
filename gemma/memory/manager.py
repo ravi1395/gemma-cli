@@ -26,6 +26,7 @@ from gemma.memory.context import ContextAssembler
 from gemma.memory.models import ConversationTurn, MemoryRecord
 from gemma.memory.retrieval import MemoryRetriever
 from gemma.memory.store import MemoryStore
+from gemma.redaction import redact
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,9 @@ class MemoryManager:
         self._config = config
         self._store = store or MemoryStore(config)
         self._embedder = embedder or Embedder(
-            model=config.embedding_model, host=config.ollama_host
+            model=config.embedding_model,
+            host=config.ollama_host,
+            keep_alive=config.ollama_keep_alive,
         )
         self._pipeline = pipeline or CondensationPipeline(config)
         self._assembler = assembler or ContextAssembler(config)
@@ -95,10 +98,25 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def record_turn(self, role: str, content: str) -> None:
-        """Log a turn. Triggers background condensation on overflow."""
+        """Log a turn. Triggers background condensation on overflow.
+
+        The content is scrubbed for known secret patterns (AWS keys, GitHub
+        tokens, JWTs, PRIVATE KEY blocks, .env-shaped lines, Bearer tokens)
+        BEFORE the turn is constructed, so nothing sensitive is written to
+        the in-memory fallback list, the Redis sliding window, or any later
+        condensed memory derived from it.
+        """
         self._turn_counter += 1
+        clean_content, findings = redact(content)
+        if findings:
+            logger.info(
+                "Redacted %d secret(s) from %s turn: types=%s",
+                len(findings),
+                role,
+                sorted({f.type for f in findings}),
+            )
         turn = ConversationTurn(
-            role=role, content=content, turn_number=self._turn_counter
+            role=role, content=clean_content, turn_number=self._turn_counter
         )
 
         if not self.available:

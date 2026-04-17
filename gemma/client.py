@@ -41,6 +41,9 @@ def chat(
         messages=messages,
         stream=stream,
         think=config.thinking_mode,
+        # keep_alive tells Ollama how long to hold the model in RAM after this
+        # call. Warm re-use across invocations is worth ~1-2s of TTFT.
+        keep_alive=config.ollama_keep_alive,
         options={"temperature": config.temperature},
     )
     if stream:
