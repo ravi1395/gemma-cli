@@ -1,5 +1,7 @@
 # gemma-cli
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backed recursive summarization memory system** — giving a 4B parameter model cross-session long-term memory that effectively bypasses its token-window limit.
 
 ---
@@ -691,3 +693,7 @@ pytest tests/test_context.py -v
 ```
 
 The suite covers: models, store CRUD, retrieval cosine math, context assembly + budget trimming, condensation prompt parsing, and MemoryManager orchestration (sliding window, condensation trigger, degraded mode, stats).
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

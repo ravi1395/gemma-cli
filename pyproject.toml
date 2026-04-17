@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gemma-cli"
 version = "0.1.0"
 description = "Local CLI for Google's Gemma 4 model via Ollama, with Redis-backed recursive memory."
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
     "typer>=0.12",
