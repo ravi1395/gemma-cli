@@ -384,6 +384,7 @@ def _agent_loop(
     dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     session_cache: Optional[Any] = None,
     session_id: str = "agent",
+    _plan_depth: int = 0,
 ) -> tuple[str, bool]:
     """OpenAI-style tool-use loop for ``gemma ask``.
 
@@ -400,25 +401,49 @@ def _agent_loop(
         Single-call turns and ``concurrency == 1`` skip the executor
         to keep microsecond overhead identical to the pre-#20 path.
 
+    Planner/executor split (#19):
+        When the model calls the ``plan`` meta-tool, its handler raises
+        :class:`PlanRequested`. The dispatcher re-raises; this loop
+        catches the sentinel and delegates to
+        :func:`gemma.agent.planner.run_plan`, which executes each step
+        in its own bounded sub-conversation and folds a single
+        ``role=tool`` summary back into ``messages``. The loop then
+        continues, letting the model produce a final reply based on
+        the plan's results.
+
     Args:
         client:       Object with a ``.chat(model, messages, tools, ...)``
                       method (``ollama.Client`` or a test stub).
-        cfg:          Active Config — provides model, temperature, and
-                      ``agent_tool_concurrency`` for #20.
+        cfg:          Active Config — provides model, temperature,
+                      ``agent_tool_concurrency`` (#20), and
+                      ``plan_tool_enabled`` / ``agent_max_plan_depth``
+                      (#19).
         messages:     Message list, modified in place as turns accumulate.
-        tools:        Tool schemas in Ollama/OpenAI format.
+        tools:        Tool schemas in Ollama/OpenAI format. Caller is
+                      expected to have already filtered ``plan`` out
+                      when ``cfg.plan_tool_enabled`` is False; this
+                      function also gates per-call as a safety net.
         budget:       Maximum number of model-call turns.
         dispatch:     Callable ``(name, args) → ToolResult | str``.  When
                       ``None``, tool calls are acknowledged but skipped.
         session_cache: ``AgentSessionCache`` for within-session memoization.
                       ``None`` means caching is disabled.
         session_id:   Audit record identifier.
+        _plan_depth:  Planner nesting depth. 0 at the top level; bumped
+                      when :func:`run_plan` recurses into this loop for
+                      sub-step execution. A ``plan()`` call at
+                      ``depth >= cfg.agent_max_plan_depth`` is refused
+                      without executing.
 
     Returns:
         ``(final_reply_text, budget_exhausted)`` where
         ``budget_exhausted`` is True when all ``budget`` turns were
         consumed without a terminal reply.
     """
+    # Local import to avoid a module-level cycle (planner imports
+    # _agent_loop via a lazy hook of its own).
+    from gemma.tools.planning import PlanRequested
+
     concurrency = _clamped_concurrency(cfg)
 
     last_content = ""
@@ -455,13 +480,36 @@ def _agent_loop(
         })
 
         # --- Fan-out within the turn (parallel when >1 call + concurrency>1) ---
-        per_call_messages = _dispatch_turn_calls(
-            raw_calls,
-            concurrency=concurrency,
-            dispatch=dispatch,
-            session_cache=session_cache,
-            session_id=session_id,
-        )
+        try:
+            per_call_messages = _dispatch_turn_calls(
+                raw_calls,
+                concurrency=concurrency,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            )
+        except PlanRequested as plan_req:
+            # The model asked for a planner/executor split. Decide
+            # whether to honour it (feature flag + depth cap) and fall
+            # back to a structured refusal otherwise. Either way we
+            # synthesise a single ``role=tool`` message so the outer
+            # loop continues cleanly — the model gets to react on the
+            # next turn.
+            _handle_plan_request(
+                plan_req=plan_req,
+                client=client,
+                cfg=cfg,
+                messages=messages,
+                tools=tools,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+                depth=_plan_depth,
+            )
+            # Continue the loop: next iteration, the model replies to
+            # the planning summary. No ``per_call_messages`` to append.
+            continue
+
         for tool_msg in per_call_messages:
             if tool_msg is not None:
                 messages.append(tool_msg)
@@ -470,6 +518,75 @@ def _agent_loop(
         return last_content, True
 
     return last_content, False
+
+
+def _handle_plan_request(
+    *,
+    plan_req: Any,
+    client: Any,
+    cfg: "Config",
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+    depth: int = 0,
+) -> None:
+    """React to a :class:`PlanRequested` sentinel from the current turn.
+
+    Policy:
+        * ``cfg.plan_tool_enabled`` False → append a refusal tool
+          message naming the reason.
+        * ``depth + 1 > cfg.agent_max_plan_depth`` → refuse (prevents
+          unbounded nested planning).
+        * Otherwise, hand off to
+          :func:`gemma.agent.planner.run_plan`, which mutates
+          ``messages`` in place by appending one summary tool message.
+
+    Args:
+        plan_req:  The caught :class:`PlanRequested` instance.
+        client, cfg, messages, tools, dispatch, session_cache,
+        session_id: Forwarded to the planner (or ignored on refusal).
+        depth: Current planner depth. The handler increments it by 1
+            before recursing so nested plans accumulate.
+    """
+    # Local import keeps the cycle broken and delays planner cost to
+    # the first actual plan invocation.
+    from gemma.agent.planner import _make_refusal_message, run_plan
+
+    max_depth = int(getattr(cfg, "agent_max_plan_depth", 1) or 1)
+
+    if not getattr(cfg, "plan_tool_enabled", False):
+        messages.append(_make_refusal_message(
+            reason=(
+                "plan tool is disabled for this session "
+                "(set plan_tool_enabled=true in the active profile to enable)"
+            ),
+            steps=list(getattr(plan_req, "steps", []) or []),
+        ))
+        return
+
+    if depth + 1 > max_depth:
+        messages.append(_make_refusal_message(
+            reason=(
+                f"nested plan depth exceeded (max {max_depth}); "
+                "finish the current step without calling plan() again"
+            ),
+            steps=list(getattr(plan_req, "steps", []) or []),
+        ))
+        return
+
+    run_plan(
+        client=client,
+        cfg=cfg,
+        parent_messages=messages,
+        steps=list(plan_req.steps),
+        tools=tools,
+        dispatch=dispatch,
+        session_cache=session_cache,
+        session_id=session_id,
+        depth=depth + 1,
+    )
 
 
 def _dispatch_turn_calls(
@@ -621,6 +738,16 @@ def ask(
                 budget=cfg.agent_max_turns,
             )
             tool_schemas = dispatcher.advertised_schemas()
+            # Filter the ``plan`` meta-tool out of the advertised list
+            # when the feature flag is off (#19). The tool stays in the
+            # registry — _agent_loop still has a belt-and-braces guard
+            # — but hiding it from the model keeps the tool-use prompt
+            # minimal for profiles that have not opted in yet.
+            if not getattr(cfg, "plan_tool_enabled", False):
+                tool_schemas = [
+                    s for s in tool_schemas
+                    if s.get("function", {}).get("name") != "plan"
+                ]
             ollama_client = _ollama.Client(host=cfg.ollama_host)
 
             session_cache = None

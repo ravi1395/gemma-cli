@@ -63,6 +63,27 @@ class Config:
     # the legacy serial path and skips ``ThreadPoolExecutor`` entirely.
     agent_tool_concurrency: int = 4
 
+    # --- Planner/executor split (item #19) ---
+    # When True, the ``plan`` meta-tool is advertised and, on use,
+    # switches the loop into executor mode (each step runs in its own
+    # sub-conversation so large tool bodies stay out of the parent
+    # log). Off by default while we gather field data; flip to True
+    # per-profile once results are confirmed.
+    plan_tool_enabled: bool = False
+    # Maximum nesting depth for plan(). 1 means "one level of planning
+    # only" — a step's sub-conversation may not itself call plan.
+    # Higher values are supported but rarely useful; keep at 1.
+    agent_max_plan_depth: int = 1
+    # Interactive confirmation threshold: plans with MORE than this many
+    # steps prompt the user for y/N before executing, in TTY sessions.
+    # A value of 0 disables confirmation entirely.
+    plan_confirm_threshold: int = 3
+    # Lower bound on the per-step agent budget. Even when the parent
+    # budget divided evenly across steps would give less, each step
+    # still gets at least this many turns so it has a chance to
+    # call-then-reply. A value of 2 is the practical minimum.
+    plan_min_step_budget: int = 2
+
     # --- Web search tool (item #16) ---
     # Pluggable backend selector — see gemma/tools/backends/ for the
     # available implementations. ``duckduckgo`` requires no API key and

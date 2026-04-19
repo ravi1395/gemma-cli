@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from gemma.tools import audit as _audit
 from gemma.tools import registry as _registry
 from gemma.tools.capabilities import Capability, GatingContext, gate
+from gemma.tools.planning import PlanRequested
 from gemma.tools.registry import ToolResult, ToolSpec
 
 
@@ -144,6 +145,23 @@ class Dispatcher:
         started = time.monotonic()
         try:
             result = handler(**args)
+        except PlanRequested as plan_exc:
+            # Sentinel from the ``plan`` meta-tool (#19). Audit the
+            # entry — it is a legitimate, successful invocation from
+            # the dispatcher's point of view — and re-raise so the
+            # agent loop can switch into executor mode.
+            duration_ms = int((time.monotonic() - started) * 1000)
+            _audit.append(_audit.make_record(
+                tool=name,
+                capability=spec.capability.value,
+                args=args,
+                session_id=self.session_id,
+                exit_code=0,
+                duration_ms=duration_ms,
+                approved_by=approved_by,
+                refusal_reason=None,
+            ))
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             # Handlers shouldn't raise, but if one does, never let it
             # crash the CLI mid-turn.

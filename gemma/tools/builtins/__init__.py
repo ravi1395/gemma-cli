@@ -23,3 +23,4 @@ from gemma.tools.builtins import tests      # noqa: F401
 from gemma.tools.builtins import net_fetch   # noqa: F401
 from gemma.tools.builtins import rag_query   # noqa: F401
 from gemma.tools.builtins import web_search  # noqa: F401
+from gemma.tools.builtins import plan        # noqa: F401
