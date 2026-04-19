@@ -38,7 +38,7 @@ per-file set avoids scanning the whole index on every delete.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -80,8 +80,53 @@ def _k_file_chunks(ns: str, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Content-hash embedding cache (item #10)
+# ---------------------------------------------------------------------------
+#
+# The cache is deliberately **namespace-agnostic**: if two branches of
+# the same repo contain an identical chunk, they should both benefit
+# from one embedding. The version prefix (``v1``) lets us evolve the
+# ``embed_input`` format later without orphaning existing keys — bump
+# to ``v2`` and the old keys just time out via their TTL.
+#
+# Keys:
+#   gemma:rag:embed_cache:v1:{model}:{sha256(embed_input)} -> float32 bytes
+
+#: Pinned key prefix used by mget/mset helpers and by the CLI admin
+#: surface. Exported so scan-based cleanup tools can match it.
+EMBED_CACHE_PREFIX = "gemma:rag:embed_cache:v1"
+
+
+def _k_embed_cache(model: str, content_hash: str) -> str:
+    """Return the Redis key for one cached embedding.
+
+    ``model`` is embedded verbatim so a mixed-model install (e.g. a
+    profile that flipped to ``mxbai-embed-large``) doesn't silently
+    read vectors from the wrong encoder. ``content_hash`` is a 64-char
+    lowercase hex digest from sha256.
+    """
+    return f"{EMBED_CACHE_PREFIX}:{model}:{content_hash}"
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
+@dataclass
+class StoreSnapshot:
+    """Lightweight read-only view of a namespace captured in one pipeline.
+
+    Replaces three sequential Redis round-trips in ``status_command`` with
+    a single pipelined call (#11).
+    """
+
+    #: Embedding-model fingerprint set by the indexer (model, dim, last_indexed_at).
+    meta: Dict[str, str] = field(default_factory=dict)
+    #: Number of files currently recorded in the manifest.
+    manifest_size: int = 0
+    #: Total number of active chunks in the index SET.
+    chunk_count: int = 0
+
 
 @dataclass
 class StoredChunk:
@@ -124,6 +169,7 @@ class RedisVectorStore:
         redis_url: str = "redis://localhost:6379/0",
         *,
         client: Optional[Any] = None,
+        pool: Optional[Any] = None,
     ):
         """Wire up the store.
 
@@ -132,6 +178,10 @@ class RedisVectorStore:
             redis_url: Used to build a real client when ``client`` is None.
             client:    Pre-built Redis client. Tests inject ``fakeredis``
                        here; production code lets us build our own.
+            pool:      Optional shared :class:`redis.ConnectionPool` (#3).
+                       When supplied, text + binary clients are built
+                       from it so the store doesn't open its own TCP
+                       connections.
 
         Note: Redis clients must be constructed with
         ``decode_responses=True`` so ``hgetall`` returns ``str``
@@ -140,6 +190,7 @@ class RedisVectorStore:
         """
         self._namespace = namespace
         self._redis_url = redis_url
+        self._pool = pool
         self._client = client
         self._binary_client: Optional[Any] = None
 
@@ -158,7 +209,10 @@ class RedisVectorStore:
                 raise RuntimeError(
                     "redis-py not installed. RAG requires the 'memory' extra."
                 )
-            self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+            if self._pool is not None:
+                self._client = redis.Redis(connection_pool=self._pool, decode_responses=True)
+            else:
+                self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
         return self._client
 
     def _binary_conn(self) -> Any:
@@ -306,6 +360,30 @@ class RedisVectorStore:
         c = self._conn()
         return dict(c.hgetall(_k_meta(self._namespace)))
 
+    def snapshot(self) -> "StoreSnapshot":
+        """Fetch meta, manifest size, and chunk count in one Redis pipeline.
+
+        Replaces three sequential round-trips (``get_meta``,
+        ``load_manifest_hash`` + ``len``, ``chunk_count``) with a single
+        pipelined batch so ``status_command`` pays one network RTT instead
+        of three (#11).
+
+        Returns:
+            A :class:`StoreSnapshot` populated from the current namespace.
+        """
+        c = self._conn()
+        pipe = c.pipeline()
+        pipe.hgetall(_k_meta(self._namespace))
+        # HLEN is cheaper than HGETALL when we only need the count.
+        pipe.hlen(_k_manifest(self._namespace))
+        pipe.scard(_k_index(self._namespace))
+        meta_raw, manifest_size, chunk_count = pipe.execute()
+        return StoreSnapshot(
+            meta=dict(meta_raw) if meta_raw else {},
+            manifest_size=int(manifest_size),
+            chunk_count=int(chunk_count),
+        )
+
     # ------------------------------------------------------------------
     # Read helpers
     # ------------------------------------------------------------------
@@ -332,6 +410,35 @@ class RedisVectorStore:
             text=row.get("text", ""),
             header=row.get("header") or None,
         )
+
+    def get_chunks(self, chunk_ids: List[str]) -> List[Optional[StoredChunk]]:
+        """Pipelined fetch of many chunks in a single round-trip.
+
+        Replaces the per-winner ``get_chunk`` loop in :meth:`search` with
+        one batched HGETALL pipeline (#1). Returns a list the same length
+        as ``chunk_ids``; entries where the chunk was absent are ``None``.
+        """
+        if not chunk_ids:
+            return []
+        c = self._conn()
+        pipe = c.pipeline()
+        for cid in chunk_ids:
+            pipe.hgetall(_k_chunk(self._namespace, cid))
+        rows = pipe.execute()
+        out: List[Optional[StoredChunk]] = []
+        for cid, row in zip(chunk_ids, rows):
+            if not row:
+                out.append(None)
+                continue
+            out.append(StoredChunk(
+                id=cid,
+                path=row.get("path", ""),
+                start_line=int(row.get("start_line", 0) or 0),
+                end_line=int(row.get("end_line", 0) or 0),
+                text=row.get("text", ""),
+                header=row.get("header") or None,
+            ))
+        return out
 
     def get_embedding(self, chunk_id: str) -> Optional[np.ndarray]:
         """Fetch one embedding. Returns None if the chunk is absent."""
@@ -377,18 +484,39 @@ class RedisVectorStore:
         of two L2-normalised vectors is just their dot product — fast
         and branch-free.
         """
+        hits, _embed_map = self.search_with_embeddings(query, k=k)
+        return hits
+
+    def search_with_embeddings(
+        self, query: np.ndarray, k: int = 5,
+    ) -> Tuple[List[StoredChunk], Dict[str, np.ndarray]]:
+        """Top-``k`` search that also returns the full pool embedding map (#1).
+
+        Folds what used to be two MGETs per query (one here, one in
+        :meth:`RAGRetriever.query` for the MMR re-rank) into a single
+        bulk fetch. Callers that don't need the matrix can keep using
+        :meth:`search`.
+
+        The winner metadata is fetched via a single pipelined HGETALL
+        batch (:meth:`get_chunks`) rather than per-winner round-trips.
+
+        Returns:
+            ``(hits, embed_map)``. ``embed_map`` maps every chunk id in
+            the namespace to its L2-normalised embedding so the caller
+            can compute pairwise similarities without a second MGET.
+        """
         if query.size == 0:
-            return []
+            return [], {}
 
         q = query.astype(np.float32)
         qnorm = float(np.linalg.norm(q))
         if qnorm == 0.0:
-            return []
+            return [], {}
         q = q / qnorm
 
         embeds = self.load_all_embeddings()
         if not embeds:
-            return []
+            return [], {}
 
         cids = list(embeds.keys())
         matrix = np.stack([embeds[c] for c in cids], axis=0)  # (N, D)
@@ -402,15 +530,151 @@ class RedisVectorStore:
             top_idx = np.argpartition(-scores, k)[:k]
             top_idx = top_idx[np.argsort(-scores[top_idx])]
 
+        ordered_cids = [cids[int(i)] for i in top_idx]
+        scored = {cids[int(i)]: float(scores[int(i)]) for i in top_idx}
+        # One pipelined HGETALL instead of k sequential round-trips.
+        fetched = self.get_chunks(ordered_cids)
+
         results: List[StoredChunk] = []
-        for i in top_idx:
-            cid = cids[int(i)]
-            sc = self.get_chunk(cid)
+        for cid, sc in zip(ordered_cids, fetched):
             if sc is None:
                 continue
-            sc.score = float(scores[int(i)])
+            sc.score = scored[cid]
             results.append(sc)
-        return results
+        return results, embeds
+
+    # ------------------------------------------------------------------
+    # Embedding cache (item #10)
+    # ------------------------------------------------------------------
+
+    def mget_embed_cache(
+        self, model: str, hashes: List[str],
+    ) -> List[Optional[np.ndarray]]:
+        """Bulk-fetch cached embeddings for a list of content hashes.
+
+        Always returns a list the same length as ``hashes``; entries
+        where the cache missed (or held a zero-length value) are
+        ``None``. Uses the binary client so Redis doesn't try to utf-8
+        decode float bytes.
+
+        Args:
+            model:  Embedding-model tag recorded in the key — keeps the
+                    cache honest across profile switches.
+            hashes: Lowercase hex digests (sha256) of ``embed_input``.
+        """
+        if not hashes:
+            return []
+        bc = self._binary_conn()
+        keys = [_k_embed_cache(model, h) for h in hashes]
+        raws = bc.mget(keys)
+        return [
+            np.frombuffer(r, dtype=np.float32) if r else None
+            for r in raws
+        ]
+
+    def mset_embed_cache(
+        self,
+        model: str,
+        vectors: Dict[str, np.ndarray],
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """Bulk-store embeddings keyed by content hash, optionally with TTL.
+
+        Writes happen in a single pipelined round-trip. Each vector is
+        serialised to its ``float32`` byte representation — callers can
+        reverse this with ``np.frombuffer(raw, dtype=np.float32)``.
+
+        Args:
+            model:       Embedding-model tag. Must match the one used
+                         by :meth:`mget_embed_cache` on the read side.
+            vectors:     ``{content_hash: vector}`` mapping. Empty
+                         input is a silent no-op.
+            ttl_seconds: Expiry for each key. ``None`` or ``<= 0``
+                         writes with no TTL (persist until evicted).
+        """
+        if not vectors:
+            return
+        bc = self._binary_conn()
+        pipe = bc.pipeline()
+        for content_hash, vec in vectors.items():
+            key = _k_embed_cache(model, content_hash)
+            raw = vec.astype(np.float32).tobytes()
+            if ttl_seconds and ttl_seconds > 0:
+                pipe.set(key, raw, ex=ttl_seconds)
+            else:
+                pipe.set(key, raw)
+        pipe.execute()
+
+    def embed_cache_stats(
+        self, model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a small summary of the embed cache.
+
+        Used by ``gemma rag cache stats`` — O(keys) under the hood
+        because we have to ``SCAN`` to count. For the cache sizes we
+        expect (tens of thousands of keys) this is still <100 ms.
+
+        Args:
+            model: If given, restricts the scan to keys for that
+                   specific model. Otherwise summarises across models.
+
+        Returns:
+            ``{"total_keys": int, "approx_bytes": int, "per_model":
+            {model: count}}``. ``approx_bytes`` is a fast
+            ``STRLEN`` sum — it omits Redis's own per-key overhead.
+        """
+        c = self._conn()
+        pattern = (
+            f"{EMBED_CACHE_PREFIX}:{model}:*"
+            if model
+            else f"{EMBED_CACHE_PREFIX}:*"
+        )
+        per_model: Dict[str, int] = {}
+        total_keys = 0
+        approx_bytes = 0
+        # Stream scan + STRLEN in a pipeline to bound RTTs.
+        for key in c.scan_iter(match=pattern, count=500):
+            total_keys += 1
+            # key looks like gemma:rag:embed_cache:v1:<model>:<hash>
+            parts = key.split(":", 5)
+            if len(parts) >= 6:
+                key_model = parts[4]
+                per_model[key_model] = per_model.get(key_model, 0) + 1
+            try:
+                approx_bytes += int(c.strlen(key))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return {
+            "total_keys": total_keys,
+            "approx_bytes": approx_bytes,
+            "per_model": per_model,
+        }
+
+    def clear_embed_cache(self, model: Optional[str] = None) -> int:
+        """Drop every embed-cache key, optionally filtered by model.
+
+        Uses ``scan_iter`` rather than ``KEYS`` so a huge cache doesn't
+        block the Redis server. Deletes are pipelined.
+
+        Args:
+            model: If given, restrict deletion to that model's keys.
+
+        Returns:
+            The number of keys actually deleted.
+        """
+        c = self._conn()
+        pattern = (
+            f"{EMBED_CACHE_PREFIX}:{model}:*"
+            if model
+            else f"{EMBED_CACHE_PREFIX}:*"
+        )
+        count = 0
+        pipe = c.pipeline()
+        for key in c.scan_iter(match=pattern, count=500):
+            pipe.delete(key)
+            count += 1
+        pipe.execute()
+        return count
 
     # ------------------------------------------------------------------
     # Admin

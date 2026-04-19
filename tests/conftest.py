@@ -24,6 +24,29 @@ from gemma.memory.models import (
 from gemma.memory.store import MemoryStore
 
 
+# ---------------------------------------------------------------------------
+# Warm-start guard (item #4)
+# ---------------------------------------------------------------------------
+#
+# Production defaults to ``warm_start=True`` so CLI invocations prime Ollama
+# in the background. Under pytest that would spawn real HTTP threads every
+# time a CliRunner exercises ``main_callback``; worse, it would hit whatever
+# Ollama happens to be on the dev machine. We short-circuit the spawn at
+# its single call site so no test is affected regardless of how it builds
+# its ``Config``.
+#
+# Tests that specifically exercise warm-start (see tests/test_warm_start.py)
+# opt in locally by re-patching ``_spawn_warm_start`` back to the real
+# implementation on their own fixtures.
+
+@pytest.fixture(autouse=True)
+def _disable_warm_start_in_tests(monkeypatch):
+    """Make ``_spawn_warm_start`` a no-op for the entire test session."""
+    import gemma.main as _main
+
+    monkeypatch.setattr(_main, "_spawn_warm_start", lambda cfg: None)
+
+
 @pytest.fixture
 def fake_redis() -> Iterator:
     """In-memory Redis. decode_responses matches what MemoryStore uses."""

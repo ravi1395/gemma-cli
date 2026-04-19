@@ -17,7 +17,8 @@ import fakeredis
 import numpy as np
 import pytest
 
-from gemma.rag.retrieval import RAGRetriever, _mmr, _normalise
+from gemma.rag._math import normalise as _normalise
+from gemma.rag.retrieval import RAGRetriever, _mmr
 from gemma.rag.store import RedisVectorStore, StoredChunk
 
 

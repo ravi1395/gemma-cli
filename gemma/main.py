@@ -29,14 +29,16 @@ and behave correctly when stdout is not a TTY (pipe-safe).
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
-from typing import Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from gemma.cache import build_cache
+from gemma.cache import ResponseCache
 from gemma.client import chat as client_chat
 from gemma.commands.clipboard import status_command as clipboard_status_command
 from gemma.commands.completion import (
@@ -59,6 +61,8 @@ from gemma.commands.shell import (
     why_command,
 )
 from gemma.commands.rag import (
+    cache_clear_command as rag_cache_clear_command,
+    cache_stats_command as rag_cache_stats_command,
     index_command as rag_index_command,
     query_command as rag_query_command,
     reset_command as rag_reset_command,
@@ -74,6 +78,7 @@ from gemma.config import Config
 from gemma.history import SessionHistory
 from gemma.memory import MemoryManager
 from gemma.output import OutputMode, render_response
+from gemma.session import GemmaSession
 
 
 app = typer.Typer(help="Local CLI for Google's Gemma 4 model via Ollama.")
@@ -112,6 +117,15 @@ rag_app.command("index")(rag_index_command)
 rag_app.command("query")(rag_query_command)
 rag_app.command("status")(rag_status_command)
 rag_app.command("reset")(rag_reset_command)
+
+# Item #10 — admin surface for the content-hash embed cache. Grouped
+# under ``gemma rag cache`` so ``stats`` and ``clear`` stay together
+# without polluting the top-level ``rag`` namespace.
+rag_cache_app = typer.Typer(help="Inspect or clear the embedding cache.")
+rag_cache_app.command("stats")(rag_cache_stats_command)
+rag_cache_app.command("clear")(rag_cache_clear_command)
+rag_app.add_typer(rag_cache_app, name="cache")
+
 app.add_typer(rag_app, name="rag")
 
 # Active profile set by --profile flag in the top-level callback.
@@ -136,6 +150,78 @@ console = Console()
 
 
 # -----------------------------------------------------------------------------
+# Warm-start helpers (item #4)
+# -----------------------------------------------------------------------------
+#
+# On CLI startup we fire two short daemon threads — one nudges the chat
+# model into VRAM, one the embedding model — so the user's *real* request
+# doesn't pay the 1–8 s cold-load tax. Both helpers swallow every
+# exception: if Ollama is down, misconfigured, or the model isn't pulled,
+# the warm-up is a no-op and the foreground command owns the error
+# surface (much clearer than a warm-up stacktrace pointing at nothing).
+
+def _warm_ollama(cfg: Config) -> None:
+    """Best-effort warm-up of the chat model. Never raises into the foreground.
+
+    Uses ``num_predict=1`` so Ollama loads the weights and returns
+    immediately — we don't care about the token, only the side effect of
+    bringing the model resident. ``keep_alive`` mirrors the runtime config
+    so the eviction timer resets for the subsequent real request.
+    """
+    try:
+        import ollama
+
+        ollama.Client(host=cfg.ollama_host).chat(
+            model=cfg.model,
+            messages=[{"role": "user", "content": "_"}],
+            keep_alive=cfg.ollama_keep_alive,
+            options={"num_predict": 1, "temperature": 0.0},
+        )
+    except Exception:
+        # Intentional: warm-up is fire-and-forget. Logging here would
+        # produce noise for users without Ollama running who never ask
+        # for RAG/chat features.
+        pass
+
+
+def _warm_embedder(cfg: Config) -> None:
+    """Separate daemon: warm the embedding model.
+
+    Kept as its own thread (rather than chained after the chat warm-up)
+    so a slow chat load doesn't push the embed warm-up past the user's
+    first RAG call. On single-GPU boxes the two can contend; that's
+    acceptable because both still beat a cold load on the first real
+    request.
+    """
+    try:
+        import ollama
+
+        ollama.Client(host=cfg.ollama_host).embed(
+            model=cfg.embedding_model,
+            input=" ",
+        )
+    except Exception:
+        pass
+
+
+def _spawn_warm_start(cfg: Config) -> None:
+    """Spawn the two warm-up threads when the config allows.
+
+    Factored into its own function (rather than inlining in the callback)
+    so tests can monkey-patch either this seam or the individual helpers
+    without jumping through Typer.
+    """
+    if not cfg.warm_start or cfg.in_test_mode:
+        return
+    threading.Thread(
+        target=_warm_ollama, args=(cfg,), daemon=True, name="gemma-warm-chat"
+    ).start()
+    threading.Thread(
+        target=_warm_embedder, args=(cfg,), daemon=True, name="gemma-warm-embed"
+    ).start()
+
+
+# -----------------------------------------------------------------------------
 # Top-level callback — global flags (e.g. --profile) applied before subcommands
 # -----------------------------------------------------------------------------
 
@@ -154,6 +240,15 @@ def main_callback(
         # broken profiles dir never degrades the shell experience.
         autocompletion=profile_completer,
     ),
+    warm: Optional[bool] = typer.Option(
+        None,
+        "--warm/--no-warm",
+        help=(
+            "Warm Ollama's chat and embedding models in the background at "
+            "startup. On by default; pass --no-warm for scripted invocations "
+            "(e.g. 'gemma --no-warm history stats') that will never call Ollama."
+        ),
+    ),
 ) -> None:
     """gemma – local Gemma 4 CLI via Ollama."""
     global _active_profile
@@ -163,6 +258,15 @@ def main_callback(
         except FileNotFoundError as exc:
             console.print(f"[red]error: {exc}[/red]")
             raise typer.Exit(code=1)
+
+    # Resolve the config the same way _make_config does so warm-start honours
+    # both --profile and --warm/--no-warm without building the full CLI-override
+    # chain (the warm-up only needs ollama_host, model, embedding_model,
+    # ollama_keep_alive — none of the subcommand overrides).
+    cfg = dataclasses.replace(_active_profile) if _active_profile is not None else Config()
+    if warm is not None:
+        cfg = dataclasses.replace(cfg, warm_start=warm)
+    _spawn_warm_start(cfg)
 
 
 # -----------------------------------------------------------------------------
@@ -196,17 +300,6 @@ def _make_config(
     return cfg
 
 
-def _init_memory(cfg: Config) -> MemoryManager:
-    """Initialize a MemoryManager, warning the user if it falls into degraded mode."""
-    mgr = MemoryManager(cfg)
-    mgr.initialize()
-    if mgr.degraded and cfg.memory_enabled:
-        console.print(
-            "[yellow]memory: Redis unreachable, running without long-term memory[/yellow]"
-        )
-    return mgr
-
-
 def _resolve_output_mode(
     json_flag: bool,
     only: Optional[str],
@@ -236,6 +329,418 @@ def _resolve_output_mode(
 
 
 # -----------------------------------------------------------------------------
+# Agent-loop helpers
+# -----------------------------------------------------------------------------
+
+def _extract_tool_call(call: Any) -> tuple[str, Dict[str, Any]]:
+    """Extract (name, args) from an Ollama tool-call object or dict.
+
+    Handles two serialisation formats that appear in the wild:
+
+    * **Ollama SDK format** — ``{"function": {"name": ..., "arguments": {...}}}``
+      This is what a real ``ollama.Client.chat()`` response yields.
+    * **Flat format** — ``{"name": ..., "arguments": {...}}``
+      Used by bench-test stub clients so the loop can be exercised
+      without a live Ollama server.
+
+    Args:
+        call: A single element from ``message["tool_calls"]``.
+
+    Returns:
+        ``(tool_name, args_dict)`` tuple, always strings/dicts even when
+        the model returns arguments as a JSON-encoded string.
+    """
+    if isinstance(call, dict):
+        if "function" in call:
+            fn = call["function"]
+            name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+            args = fn.get("arguments", {}) if isinstance(fn, dict) else getattr(fn, "arguments", {})
+        else:
+            name = call.get("name", "")
+            args = call.get("arguments", {})
+    else:
+        # Ollama SDK Pydantic object — access via attributes.
+        fn = getattr(call, "function", None)
+        if fn is not None:
+            name = getattr(fn, "name", "")
+            args = getattr(fn, "arguments", {})
+        else:
+            name = getattr(call, "name", "")
+            args = getattr(call, "arguments", {})
+
+    # Some models serialise arguments as a JSON string rather than an object.
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+
+    return str(name), (args if isinstance(args, dict) else {})
+
+
+def _dispatch_one(
+    call: Any,
+    *,
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+) -> Optional[Dict[str, Any]]:
+    """Execute exactly one tool call and return a ``role=tool`` message.
+
+    This is the per-call unit that both the serial path and the
+    parallel-fan-out path (#20) share. Extracting it keeps both paths
+    identical in behaviour — they differ only in whether the caller
+    iterates sequentially or via ``ThreadPoolExecutor.map``.
+
+    Thread-safety:
+        The function itself is stateless; the side-effects it triggers
+        (audit log append, session cache read/write, dispatcher
+        invocation) are each responsible for their own locking:
+
+        * ``gemma.tools.audit`` serialises writes via a module-level
+          :class:`threading.Lock`.
+        * :class:`AgentSessionCache` holds its own lock over the dict.
+        * :class:`Dispatcher` guards ``calls_made`` with a lock so
+          budget accounting stays correct under concurrent dispatch.
+
+    Args:
+        call:          Raw tool-call element from the model reply.
+        dispatch:      Callable ``(name, args) → ToolResult | str``. When
+                       ``None``, returns a stub "not dispatched" message.
+        session_cache: Optional :class:`AgentSessionCache` for READ-tool
+                       memoization.
+        session_id:    Threaded into audit records.
+
+    Returns:
+        A ``role=tool`` message dict ready to append to ``messages``,
+        or ``None`` when the call has no usable tool name (in which
+        case the caller skips it to preserve prompt shape).
+    """
+    from gemma.tools import audit as _audit
+
+    # Normalise to a plain dict so _extract_tool_call is consistent.
+    if not isinstance(call, dict):
+        call = getattr(call, "__dict__", {}) or {"name": str(call)}
+    tool_name, tool_args = _extract_tool_call(call)
+    if not tool_name:
+        return None  # caller filters None out before appending
+
+    # --- Session-cache fast path (READ-only tools) ---
+    if session_cache is not None:
+        cached_val = session_cache.get(tool_name, tool_args)
+        if cached_val is not None:
+            _audit.append(_audit.make_record(
+                tool=tool_name,
+                capability="read",
+                args=tool_args,
+                session_id=session_id,
+                exit_code=0,
+                duration_ms=0,
+                approved_by="auto",
+                cached=True,
+            ))
+            return {"role": "tool", "name": tool_name, "content": cached_val}
+
+    # --- Miss — run the real dispatch (or stub). ---
+    if dispatch is not None:
+        raw_result = dispatch(tool_name, tool_args)
+        # Real Dispatcher returns ToolResult; stubs return str.
+        tool_result_str = (
+            raw_result.content if hasattr(raw_result, "content")
+            else str(raw_result)
+        )
+    else:
+        tool_result_str = f"(agent: tool {tool_name!r} not dispatched)"
+
+    # Populate cache when this tool's capability is READ.
+    if session_cache is not None:
+        try:
+            from gemma.tools import registry as _reg
+            spec, _ = _reg.get(tool_name)
+            if session_cache.is_cacheable(spec.capability.value):
+                session_cache.put(tool_name, tool_args, tool_result_str)
+        except KeyError:
+            pass  # Unregistered tool (e.g. bench stub) — skip.
+
+    return {"role": "tool", "name": tool_name, "content": tool_result_str}
+
+
+def _clamped_concurrency(cfg: "Config") -> int:
+    """Return ``cfg.agent_tool_concurrency`` clamped to ``[1, 16]``.
+
+    Hard-capped defensively even though the default is 4 — a broken
+    profile TOML setting this to 1000 should not spawn a thousand
+    threads on a user's laptop.
+    """
+    raw = int(getattr(cfg, "agent_tool_concurrency", 1))
+    return max(1, min(raw, 16))
+
+
+def _agent_loop(
+    client: Any,
+    cfg: "Config",
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    budget: int,
+    *,
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+    _plan_depth: int = 0,
+) -> tuple[str, bool]:
+    """OpenAI-style tool-use loop for ``gemma ask``.
+
+    Calls the model, dispatches any ``tool_calls``, appends
+    ``role=tool`` results, and loops until the model replies without
+    tool calls or ``budget`` turns are exhausted.
+
+    Parallel dispatch (#20):
+        When ``cfg.agent_tool_concurrency > 1`` and a single turn
+        emits more than one tool call, the calls fan out across a
+        :class:`ThreadPoolExecutor` scoped to that turn. Order is
+        preserved via ``executor.map`` so the ``role=tool`` messages
+        line up with the ``tool_call_id`` the model sees next turn.
+        Single-call turns and ``concurrency == 1`` skip the executor
+        to keep microsecond overhead identical to the pre-#20 path.
+
+    Planner/executor split (#19):
+        When the model calls the ``plan`` meta-tool, its handler raises
+        :class:`PlanRequested`. The dispatcher re-raises; this loop
+        catches the sentinel and delegates to
+        :func:`gemma.agent.planner.run_plan`, which executes each step
+        in its own bounded sub-conversation and folds a single
+        ``role=tool`` summary back into ``messages``. The loop then
+        continues, letting the model produce a final reply based on
+        the plan's results.
+
+    Args:
+        client:       Object with a ``.chat(model, messages, tools, ...)``
+                      method (``ollama.Client`` or a test stub).
+        cfg:          Active Config — provides model, temperature,
+                      ``agent_tool_concurrency`` (#20), and
+                      ``plan_tool_enabled`` / ``agent_max_plan_depth``
+                      (#19).
+        messages:     Message list, modified in place as turns accumulate.
+        tools:        Tool schemas in Ollama/OpenAI format. Caller is
+                      expected to have already filtered ``plan`` out
+                      when ``cfg.plan_tool_enabled`` is False; this
+                      function also gates per-call as a safety net.
+        budget:       Maximum number of model-call turns.
+        dispatch:     Callable ``(name, args) → ToolResult | str``.  When
+                      ``None``, tool calls are acknowledged but skipped.
+        session_cache: ``AgentSessionCache`` for within-session memoization.
+                      ``None`` means caching is disabled.
+        session_id:   Audit record identifier.
+        _plan_depth:  Planner nesting depth. 0 at the top level; bumped
+                      when :func:`run_plan` recurses into this loop for
+                      sub-step execution. A ``plan()`` call at
+                      ``depth >= cfg.agent_max_plan_depth`` is refused
+                      without executing.
+
+    Returns:
+        ``(final_reply_text, budget_exhausted)`` where
+        ``budget_exhausted`` is True when all ``budget`` turns were
+        consumed without a terminal reply.
+    """
+    # Local import to avoid a module-level cycle (planner imports
+    # _agent_loop via a lazy hook of its own).
+    from gemma.tools.planning import PlanRequested
+
+    concurrency = _clamped_concurrency(cfg)
+
+    last_content = ""
+
+    for _turn in range(budget):
+        # Non-streaming call so we see tool_calls in the complete response.
+        raw = client.chat(
+            model=cfg.model,
+            messages=messages,
+            tools=tools or [],
+            think=cfg.thinking_mode,
+            keep_alive=cfg.ollama_keep_alive,
+            options={"temperature": cfg.temperature},
+        )
+
+        # Unify dict-style and Ollama SDK object access.
+        msg = raw["message"] if isinstance(raw, dict) else raw.message
+        if isinstance(msg, dict):
+            last_content = msg.get("content", "") or ""
+            raw_calls = msg.get("tool_calls") or []
+        else:
+            last_content = getattr(msg, "content", "") or ""
+            raw_calls = getattr(msg, "tool_calls", None) or []
+
+        if not raw_calls:
+            # Model returned a plain reply — the loop is done.
+            break
+
+        # Record the assistant turn so the model sees its own requests.
+        messages.append({
+            "role": "assistant",
+            "content": last_content,
+            "tool_calls": list(raw_calls),
+        })
+
+        # --- Fan-out within the turn (parallel when >1 call + concurrency>1) ---
+        try:
+            per_call_messages = _dispatch_turn_calls(
+                raw_calls,
+                concurrency=concurrency,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            )
+        except PlanRequested as plan_req:
+            # The model asked for a planner/executor split. Decide
+            # whether to honour it (feature flag + depth cap) and fall
+            # back to a structured refusal otherwise. Either way we
+            # synthesise a single ``role=tool`` message so the outer
+            # loop continues cleanly — the model gets to react on the
+            # next turn.
+            _handle_plan_request(
+                plan_req=plan_req,
+                client=client,
+                cfg=cfg,
+                messages=messages,
+                tools=tools,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+                depth=_plan_depth,
+            )
+            # Continue the loop: next iteration, the model replies to
+            # the planning summary. No ``per_call_messages`` to append.
+            continue
+
+        for tool_msg in per_call_messages:
+            if tool_msg is not None:
+                messages.append(tool_msg)
+    else:
+        # Exhausted all budget turns without a terminal reply.
+        return last_content, True
+
+    return last_content, False
+
+
+def _handle_plan_request(
+    *,
+    plan_req: Any,
+    client: Any,
+    cfg: "Config",
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+    depth: int = 0,
+) -> None:
+    """React to a :class:`PlanRequested` sentinel from the current turn.
+
+    Policy:
+        * ``cfg.plan_tool_enabled`` False → append a refusal tool
+          message naming the reason.
+        * ``depth + 1 > cfg.agent_max_plan_depth`` → refuse (prevents
+          unbounded nested planning).
+        * Otherwise, hand off to
+          :func:`gemma.agent.planner.run_plan`, which mutates
+          ``messages`` in place by appending one summary tool message.
+
+    Args:
+        plan_req:  The caught :class:`PlanRequested` instance.
+        client, cfg, messages, tools, dispatch, session_cache,
+        session_id: Forwarded to the planner (or ignored on refusal).
+        depth: Current planner depth. The handler increments it by 1
+            before recursing so nested plans accumulate.
+    """
+    # Local import keeps the cycle broken and delays planner cost to
+    # the first actual plan invocation.
+    from gemma.agent.planner import _make_refusal_message, run_plan
+
+    max_depth = int(getattr(cfg, "agent_max_plan_depth", 1) or 1)
+
+    if not getattr(cfg, "plan_tool_enabled", False):
+        messages.append(_make_refusal_message(
+            reason=(
+                "plan tool is disabled for this session "
+                "(set plan_tool_enabled=true in the active profile to enable)"
+            ),
+            steps=list(getattr(plan_req, "steps", []) or []),
+        ))
+        return
+
+    if depth + 1 > max_depth:
+        messages.append(_make_refusal_message(
+            reason=(
+                f"nested plan depth exceeded (max {max_depth}); "
+                "finish the current step without calling plan() again"
+            ),
+            steps=list(getattr(plan_req, "steps", []) or []),
+        ))
+        return
+
+    run_plan(
+        client=client,
+        cfg=cfg,
+        parent_messages=messages,
+        steps=list(plan_req.steps),
+        tools=tools,
+        dispatch=dispatch,
+        session_cache=session_cache,
+        session_id=session_id,
+        depth=depth + 1,
+    )
+
+
+def _dispatch_turn_calls(
+    raw_calls: List[Any],
+    *,
+    concurrency: int,
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+) -> List[Optional[Dict[str, Any]]]:
+    """Dispatch all tool calls from one model turn, preserving order.
+
+    Single-call turns and ``concurrency == 1`` take a direct list
+    comprehension — no executor overhead. Multi-call turns with
+    ``concurrency > 1`` fan out through a bounded
+    :class:`ThreadPoolExecutor`; ``executor.map`` guarantees the
+    returned order matches the input order.
+    """
+    # Fast path: avoid the executor entirely when it would add overhead
+    # without any possible benefit.
+    if concurrency <= 1 or len(raw_calls) <= 1:
+        return [
+            _dispatch_one(
+                call,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            )
+            for call in raw_calls
+        ]
+
+    # Parallel fan-out. ``max_workers`` is capped at len(raw_calls) so
+    # we don't spawn idle threads for small turns. ``thread_name_prefix``
+    # makes the threads identifiable in tracebacks and profilers.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(
+        max_workers=min(concurrency, len(raw_calls)),
+        thread_name_prefix="agent-tool",
+    ) as pool:
+        return list(pool.map(
+            lambda call: _dispatch_one(
+                call,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            ),
+            raw_calls,
+        ))
+
+
+# -----------------------------------------------------------------------------
 # ask
 # -----------------------------------------------------------------------------
 
@@ -259,6 +764,13 @@ def ask(
         False, "--cache-only",
         help="Error if no cache hit (requires --no-stream).",
     ),
+    agent: bool = typer.Option(
+        True, "--agent/--no-agent",
+        help=(
+            "Enable the tool-use agent loop (default: on). "
+            "Pass --no-agent to skip tool dispatch and send a plain one-shot query."
+        ),
+    ),
 ) -> None:
     """Send a one-off prompt. Retrieves relevant memories unless --no-memory."""
     mode, field = _resolve_output_mode(json_output, only, code)
@@ -266,46 +778,109 @@ def ask(
         model=model, system=system, memory_enabled=not no_memory,
         thinking_mode=think, keep_alive=keep_alive,
     )
-    memory = _init_memory(cfg) if cfg.memory_enabled else None
 
-    if memory is not None and memory.available:
-        memory.record_turn("user", prompt)
-        messages = memory.get_context_messages(prompt, system_prompt=cfg.system_prompt)
-    else:
-        messages = [
-            {"role": "system", "content": cfg.system_prompt},
-            {"role": "user", "content": prompt},
-        ]
+    with GemmaSession(cfg) as session:
+        # Memory — only initialise when enabled; session.memory is lazy.
+        memory = None
+        if cfg.memory_enabled:
+            mgr = session.memory
+            if mgr.degraded:
+                console.print(
+                    "[yellow]memory: Redis unreachable, running without long-term memory[/yellow]"
+                )
+            memory = mgr if mgr.available else None
 
-    # Cache path: only for non-streaming, low-temperature calls.
-    cache = (
-        build_cache(cfg)
-        if (no_stream and not no_cache and cfg.cache_enabled
-                and cfg.temperature <= cfg.cache_temperature_max)
-        else None
-    )
-    cached: Optional[str] = cache.get(messages, cfg) if cache else None
+        if memory is not None:
+            memory.record_turn("user", prompt)
+            messages = memory.get_context_messages(prompt, system_prompt=cfg.system_prompt)
+        else:
+            messages = [
+                {"role": "system", "content": cfg.system_prompt},
+                {"role": "user", "content": prompt},
+            ]
 
-    if cached is not None:
-        reply = render_response(
-            iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model
+        # Stream-and-cache (#6): cache reads and writes are both valid on
+        # the streaming path now. The writer still gates on a clean
+        # stream completion so a truncated reply never lands in Redis.
+        cache = ResponseCache.eligible(
+            cfg, no_stream=True, no_cache=no_cache, prebuilt=session.cache
         )
+        cached: Optional[str] = cache.get(messages, cfg) if cache else None
+
+        if cached is not None:
+            reply, _finished = render_response(
+                iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model
+            )
+            if memory is not None and memory.available:
+                memory.record_turn("assistant", reply)
+            return
+
+        if cache_only and no_stream:
+            console.print("[red]gemma ask: no cache hit and --cache-only was set.[/red]")
+            raise typer.Exit(code=1)
+
+        # --- Agent loop path ---
+        if agent:
+            import ollama as _ollama
+
+            # Register built-in tools and build the dispatcher.
+            import gemma.tools.builtins  # noqa: F401 — triggers @tool decorators
+            from gemma.tools.capabilities import GatingContext
+            from gemma.tools.dispatcher import Dispatcher
+
+            ctx = GatingContext(
+                allow_writes=False,
+                allow_network=True,
+                is_tty=sys.stdout.isatty(),
+                auto_approve_writes=False,
+            )
+            dispatcher = Dispatcher(
+                ctx=ctx,
+                session_id=getattr(session, "_session_id", "ask"),
+                budget=cfg.agent_max_turns,
+            )
+            tool_schemas = dispatcher.advertised_schemas()
+            # Filter the ``plan`` meta-tool out of the advertised list
+            # when the feature flag is off (#19). The tool stays in the
+            # registry — _agent_loop still has a belt-and-braces guard
+            # — but hiding it from the model keeps the tool-use prompt
+            # minimal for profiles that have not opted in yet.
+            if not getattr(cfg, "plan_tool_enabled", False):
+                tool_schemas = [
+                    s for s in tool_schemas
+                    if s.get("function", {}).get("name") != "plan"
+                ]
+            ollama_client = _ollama.Client(host=cfg.ollama_host)
+
+            session_cache = None
+            if cfg.agent_tool_cache:
+                from gemma.agent.cache import AgentSessionCache
+                session_cache = AgentSessionCache()
+
+            reply, _exhausted = _agent_loop(
+                ollama_client, cfg, messages, tool_schemas,
+                cfg.agent_max_turns,
+                dispatch=dispatcher.dispatch,
+                session_cache=session_cache,
+                session_id=getattr(session, "_session_id", "ask"),
+            )
+
+            # Render the final reply via the standard output path.
+            reply, finished = render_response(
+                iter([("content", reply)]), mode=mode, stream=False, field=field, model=cfg.model
+            )
+        else:
+            gen = client_chat(messages, cfg, stream=not no_stream)
+            reply, finished = render_response(
+                gen, mode=mode, stream=not no_stream, field=field, model=cfg.model
+            )
+            finished = True  # ensure cache write below triggers
+
         if memory is not None and memory.available:
             memory.record_turn("assistant", reply)
-        return
 
-    if cache_only and no_stream:
-        console.print("[red]gemma ask: no cache hit and --cache-only was set.[/red]")
-        raise typer.Exit(code=1)
-
-    gen = client_chat(messages, cfg, stream=not no_stream)
-    reply = render_response(gen, mode=mode, stream=not no_stream, field=field, model=cfg.model)
-
-    if memory is not None and memory.available:
-        memory.record_turn("assistant", reply)
-
-    if cache and reply:
-        cache.put(messages, cfg, reply)
+        if cache and reply and finished:
+            cache.put(messages, cfg, reply)
 
 
 # -----------------------------------------------------------------------------
@@ -329,35 +904,41 @@ def chat(
         model=model, system=system, memory_enabled=not no_memory,
         thinking_mode=think, keep_alive=keep_alive,
     )
-    memory = _init_memory(cfg)
 
-    if fresh:
-        memory.clear_session()
+    with GemmaSession(cfg) as session:
+        memory = session.memory
+        if memory.degraded and cfg.memory_enabled:
+            console.print(
+                "[yellow]memory: Redis unreachable, running without long-term memory[/yellow]"
+            )
 
-    mode = "memory" if memory.available else "degraded"
-    console.print(
-        f"[dim]gemma chat ({cfg.model}, {mode} mode) "
-        f"-- type 'exit' or Ctrl-D to quit[/dim]"
-    )
+        if fresh:
+            memory.clear_session()
 
-    while True:
-        try:
-            user_input = console.input("[bold cyan]you> [/bold cyan]").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            break
-        if not user_input:
-            continue
-        if user_input.lower() in {"exit", "quit", ":q"}:
-            break
+        mode = "memory" if memory.available else "degraded"
+        console.print(
+            f"[dim]gemma chat ({cfg.model}, {mode} mode) "
+            f"-- type 'exit' or Ctrl-D to quit[/dim]"
+        )
 
-        memory.record_turn("user", user_input)
-        messages = memory.get_context_messages(user_input, system_prompt=cfg.system_prompt)
+        while True:
+            try:
+                user_input = console.input("[bold cyan]you> [/bold cyan]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+            if not user_input:
+                continue
+            if user_input.lower() in {"exit", "quit", ":q"}:
+                break
 
-        console.print("[bold green]gemma>[/bold green] ", end="")
-        gen = client_chat(messages, cfg, stream=True)
-        reply = render_response(gen, mode=OutputMode.RICH, stream=True, model=cfg.model)
-        memory.record_turn("assistant", reply)
+            memory.record_turn("user", user_input)
+            messages = memory.get_context_messages(user_input, system_prompt=cfg.system_prompt)
+
+            console.print("[bold green]gemma>[/bold green] ", end="")
+            gen = client_chat(messages, cfg, stream=True)
+            reply, _finished = render_response(gen, mode=OutputMode.RICH, stream=True, model=cfg.model)
+            memory.record_turn("assistant", reply)
 
 
 # -----------------------------------------------------------------------------
@@ -393,30 +974,28 @@ def pipe(
         {"role": "user", "content": combined},
     ]
 
-    # Cache path: only for non-streaming, low-temperature calls.
-    cache = (
-        build_cache(cfg)
-        if (no_stream and not no_cache and cfg.cache_enabled
-                and cfg.temperature <= cfg.cache_temperature_max)
-        else None
-    )
-    cached: Optional[str] = cache.get(messages, cfg) if cache else None
-
-    if cached is not None:
-        render_response(
-            iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model
+    with GemmaSession(cfg) as session:
+        # Stream-and-cache (#6): see ``ask`` for the full rationale.
+        cache = ResponseCache.eligible(
+            cfg, no_stream=True, no_cache=no_cache, prebuilt=session.cache
         )
-        return
+        cached: Optional[str] = cache.get(messages, cfg) if cache else None
 
-    if cache_only and no_stream:
-        console.print("[red]gemma pipe: no cache hit and --cache-only was set.[/red]")
-        raise typer.Exit(code=1)
+        if cached is not None:
+            render_response(
+                iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model
+            )
+            return
 
-    gen = client_chat(messages, cfg, stream=not no_stream)
-    result = render_response(gen, mode=mode, stream=not no_stream, field=field, model=cfg.model)
+        if cache_only and no_stream:
+            console.print("[red]gemma pipe: no cache hit and --cache-only was set.[/red]")
+            raise typer.Exit(code=1)
 
-    if cache and result:
-        cache.put(messages, cfg, result)
+        gen = client_chat(messages, cfg, stream=not no_stream)
+        result, finished = render_response(gen, mode=mode, stream=not no_stream, field=field, model=cfg.model)
+
+        if cache and result and finished:
+            cache.put(messages, cfg, result)
 
 
 # -----------------------------------------------------------------------------

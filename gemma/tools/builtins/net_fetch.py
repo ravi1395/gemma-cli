@@ -25,6 +25,16 @@ import urllib.request
 from pathlib import Path
 from typing import List, Optional
 
+# ``trafilatura`` is an optional dep (install with ``pip install '.[agent]'``).
+# We import it lazily at module load so the rest of the tool works fine
+# when the extra is not installed.
+try:
+    import trafilatura as _trafilatura  # type: ignore[import-not-found]
+    _HAS_TRAFILATURA = True
+except ImportError:
+    _trafilatura = None  # type: ignore[assignment]
+    _HAS_TRAFILATURA = False
+
 # ``tomllib`` landed in Python 3.11; fall back to ``tomli`` (API-compatible)
 # on 3.10 so the allowlist config loads identically on both interpreters.
 try:
@@ -87,8 +97,10 @@ def _load_allowlist() -> List[str]:
     name="http_get",
     description=(
         "Issue an HTTPS GET against an allowlisted host and return the "
-        "response body. Non-HTTPS URLs and non-allowlisted hosts are "
-        "refused. Response body is capped at 256 KB."
+        "response body. HTML pages are automatically extracted to markdown "
+        "to save tokens (pass raw=true to get the original HTML). "
+        "Non-HTTPS URLs and non-allowlisted hosts are refused. "
+        "Response body is capped at 256 KB."
     ),
     parameters={
         "type": "object",
@@ -96,6 +108,13 @@ def _load_allowlist() -> List[str]:
             "url": {
                 "type": "string",
                 "description": "Full URL. Scheme must be https://.",
+            },
+            "raw": {
+                "type": "boolean",
+                "description": (
+                    "If true, return the raw response body without HTML→markdown "
+                    "extraction. Defaults to false."
+                ),
             },
         },
         "required": ["url"],
@@ -105,8 +124,13 @@ def _load_allowlist() -> List[str]:
     timeout_s=int(_HTTP_TIMEOUT),
     max_output_bytes=_RESPONSE_CAP_BYTES,
 ))
-def http_get(url: str) -> ToolResult:
-    """Fetch ``url`` over HTTPS with policy enforcement."""
+def http_get(url: str, raw: bool = False) -> ToolResult:
+    """Fetch ``url`` over HTTPS with policy enforcement.
+
+    Args:
+        url: Full HTTPS URL to fetch.
+        raw: Skip HTML→markdown extraction and return the raw response body.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
     except ValueError:
@@ -142,7 +166,7 @@ def http_get(url: str) -> ToolResult:
     try:
         ctx = ssl.create_default_context()
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT, context=ctx) as resp:
-            raw = resp.read(_RESPONSE_CAP_BYTES + 1)
+            raw_bytes = resp.read(_RESPONSE_CAP_BYTES + 1)
             status = resp.status
             headers = {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as exc:
@@ -154,20 +178,38 @@ def http_get(url: str) -> ToolResult:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return ToolResult(ok=False, error="fetch_failed", content=f"fetch failed: {exc}")
 
-    truncated = len(raw) > _RESPONSE_CAP_BYTES
-    body_bytes = raw[:_RESPONSE_CAP_BYTES]
+    truncated = len(raw_bytes) > _RESPONSE_CAP_BYTES
+    body_bytes = raw_bytes[:_RESPONSE_CAP_BYTES]
     body = body_bytes.decode("utf-8", errors="replace")
     if truncated:
         body += f"\n…[truncated at {_RESPONSE_CAP_BYTES} bytes]"
+
+    content_type = headers.get("content-type", "").lower()
+    is_html = "text/html" in content_type
+    extracted = False
+
+    # HTML→markdown extraction: strip navigation, scripts, and ads so the
+    # model only sees the main content. Falls back to raw HTML when
+    # trafilatura is not installed or extraction yields nothing.
+    if is_html and not raw and _HAS_TRAFILATURA:
+        md = _trafilatura.extract(  # type: ignore[union-attr]
+            body,
+            include_comments=False,
+            output_format="markdown",
+        )
+        if md:
+            body = md
+            extracted = True
 
     return ToolResult(
         ok=True,
         content=body,
         metadata={
             "status": status,
-            "content_type": headers.get("content-type", ""),
+            "content_type": content_type,
             "truncated": truncated,
             "bytes_read": len(body_bytes),
+            "html_extracted": extracted,
         },
     )
 

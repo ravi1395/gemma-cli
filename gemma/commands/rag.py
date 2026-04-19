@@ -15,7 +15,7 @@ patch the Ollama or Redis clients.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import typer
 from rich.console import Console
@@ -29,6 +29,9 @@ from gemma.rag import (
     RedisVectorStore,
     resolve_namespace,
 )
+
+if TYPE_CHECKING:
+    from gemma.session import GemmaSession
 
 
 console = Console()
@@ -71,15 +74,37 @@ def set_embedder_factory(factory: Callable[[Config], Any]) -> None:
 # Shared wiring
 # ---------------------------------------------------------------------------
 
-def _wire(root: Path, cfg: Optional[Config] = None):
+def _wire(
+    root: Path,
+    cfg: Optional[Config] = None,
+    session: Optional["GemmaSession"] = None,
+):
     """Build (cfg, store, embedder) for a given workspace root.
 
     Used by every subcommand so the Redis namespace is derived in one
-    place and only one Ollama client is created per CLI invocation.
+    place per CLI invocation.
+
+    When a :class:`~gemma.session.GemmaSession` is supplied the store's
+    text client is replaced with the session's shared Redis connection so
+    all subsystems (memory, cache, RAG) share a single socket. The
+    embedder factory is still honoured — tests override it to inject stub
+    embedders without needing a real Ollama server.
     """
-    cfg = cfg or Config()
-    namespace = resolve_namespace(root)
+    cfg = cfg or (session._cfg if session is not None else Config())
+    # Memoised branch detection avoids re-forking ``git rev-parse`` on
+    # every rag subcommand within the same session (#8).
+    branch = session.branch_for(root) if session is not None else None
+    namespace = resolve_namespace(root, branch=branch)
     store = _store_factory(namespace, cfg.redis_url)
+    # Inject the session's shared client and pool when available
+    # (production path). Tests override _store_factory to return a
+    # pre-wired fakeredis store, so store._client is already set and we
+    # leave it alone.
+    if session is not None and store._client is None:
+        if session.redis_client is not None:
+            store._client = session.redis_client
+        if session.redis_pool is not None and store._pool is None:
+            store._pool = session.redis_pool
     embedder = _embedder_factory(cfg)
     return cfg, store, embedder
 
@@ -93,23 +118,45 @@ def index_command(
         None,
         help="Workspace root to index. Defaults to the current working directory.",
     ),
+    force_hash: bool = typer.Option(
+        False,
+        "--force-hash",
+        help="Always recompute SHA-1 (bypass the mtime+size fast path).",
+    ),
 ) -> None:
     """Incrementally index the workspace into Redis.
 
     The first call embeds every matching file; subsequent calls re-embed
     only files whose content changed (by mtime+size+sha1).
     """
+    from gemma.session import GemmaSession
+
     root = (path or Path.cwd()).resolve()
     if not root.is_dir():
         console.print(f"[red]error: {root} is not a directory[/red]")
         raise typer.Exit(code=1)
 
-    cfg, store, embedder = _wire(root)
+    with GemmaSession(Config()) as session:
+        cfg, store, embedder = _wire(root, session=session)
 
-    console.print(f"indexing [bold]{root}[/bold] → namespace [cyan]{store.namespace}[/cyan]")
+        console.print(f"indexing [bold]{root}[/bold] → namespace [cyan]{store.namespace}[/cyan]")
 
-    indexer = RAGIndexer(root=root, store=store, embedder=embedder)
-    stats = indexer.index(progress=lambda msg: console.print(f"· {msg}", style="dim"))
+        # Item #9: each worker gets its own embedder so per-thread
+        # HTTP sessions don't serialise on a single keep-alive pool.
+        # Item #10: consult the content-hash embed cache before each
+        # call; cache_ttl is promoted from days → seconds here.
+        ttl_seconds = max(0, int(cfg.embed_cache_ttl_days)) * 24 * 3600
+        indexer = RAGIndexer(
+            root=root, store=store, embedder=embedder,
+            concurrency=cfg.embed_concurrency,
+            embedder_factory=lambda: _embedder_factory(cfg),
+            cache_enabled=cfg.embed_cache_enabled,
+            cache_ttl_seconds=ttl_seconds or None,
+        )
+        stats = indexer.index(
+            progress=lambda msg: console.print(f"· {msg}", style="dim"),
+            force_hash=force_hash,
+        )
 
     console.print()
     console.print(stats.summary())
@@ -137,18 +184,24 @@ def query_command(
     ),
 ) -> None:
     """Search the indexed workspace for chunks relevant to ``question``."""
-    root = (path or Path.cwd()).resolve()
-    _cfg, store, embedder = _wire(root)
+    from gemma.session import GemmaSession
 
-    if store.chunk_count() == 0:
+    root = (path or Path.cwd()).resolve()
+    with GemmaSession(Config()) as session:
+        _cfg, store, embedder = _wire(root, session=session)
+
+        retriever = RAGRetriever(store, embedder)
+        hits = retriever.query(question, k=k, mmr_lambda=mmr)
+
+    # Empty hit list with no namespace meta means the store has never been
+    # indexed — give a more actionable message than "no hits".
+    # Avoids the prior SCARD probe that ran before every query (#7).
+    if not hits and not store.get_meta():
         console.print(
             "[yellow]no chunks indexed for this workspace. "
             "run `gemma rag index` first.[/yellow]"
         )
         raise typer.Exit(code=1)
-
-    retriever = RAGRetriever(store, embedder)
-    hits = retriever.query(question, k=k, mmr_lambda=mmr)
 
     if not hits:
         console.print("[yellow]no hits.[/yellow]")
@@ -181,22 +234,23 @@ def status_command(
     ),
 ) -> None:
     """Report what's indexed for the current workspace + namespace."""
-    root = (path or Path.cwd()).resolve()
-    _cfg, store, _embedder = _wire(root)
+    from gemma.session import GemmaSession
 
-    meta = store.get_meta()
-    manifest_size = len(store.load_manifest_hash())
-    chunk_count = store.chunk_count()
+    root = (path or Path.cwd()).resolve()
+    with GemmaSession(Config()) as session:
+        _cfg, store, _embedder = _wire(root, session=session)
+        # Single pipelined read replaces three sequential round-trips (#11).
+        snap = store.snapshot()
 
     table = Table(title=f"RAG status — {root}", show_header=False, pad_edge=False)
     table.add_column("field", style="cyan")
     table.add_column("value")
     table.add_row("namespace", store.namespace)
-    table.add_row("files in manifest", str(manifest_size))
-    table.add_row("chunks indexed", str(chunk_count))
-    table.add_row("embedding model", meta.get("model", "—"))
-    table.add_row("embedding dim", meta.get("dim", "—"))
-    table.add_row("last indexed at (unix)", meta.get("last_indexed_at", "—"))
+    table.add_row("files in manifest", str(snap.manifest_size))
+    table.add_row("chunks indexed", str(snap.chunk_count))
+    table.add_row("embedding model", snap.meta.get("model", "—"))
+    table.add_row("embedding dim", snap.meta.get("dim", "—"))
+    table.add_row("last indexed at (unix)", snap.meta.get("last_indexed_at", "—"))
     console.print(table)
 
 
@@ -220,17 +274,105 @@ def reset_command(
     vectors are only valid for one ``(model, dim)`` pair) or when you
     want to force a full re-index.
     """
-    root = (path or Path.cwd()).resolve()
-    _cfg, store, _embedder = _wire(root)
+    from gemma.session import GemmaSession
 
+    root = (path or Path.cwd()).resolve()
+    with GemmaSession(Config()) as session:
+        _cfg, store, _embedder = _wire(root, session=session)
+
+        if not yes:
+            confirm = typer.confirm(
+                f"clear namespace {store.namespace} for {root}?",
+                default=False,
+            )
+            if not confirm:
+                console.print("[yellow]aborted.[/yellow]")
+                raise typer.Exit(code=1)
+
+        deleted = store.clear_namespace()
+    console.print(f"cleared {deleted} keys for namespace [cyan]{store.namespace}[/cyan]")
+
+
+# ---------------------------------------------------------------------------
+# `gemma rag cache stats` / `gemma rag cache clear` (item #10)
+# ---------------------------------------------------------------------------
+#
+# The embed cache is namespace-agnostic (shared across repos and
+# branches because keys are content-addressable), so the admin surface
+# doesn't need a ``--root``. It does need ``--model`` since the cache
+# keys the model tag into every entry: switching encoders should not
+# require nuking vectors the old encoder can still use.
+
+def cache_stats_command(
+    model: Optional[str] = typer.Option(
+        None, "--model",
+        help="Restrict stats to one embedding model (default: all).",
+    ),
+) -> None:
+    """Report size and shape of the content-hash embed cache.
+
+    The scan is O(keys); for the sizes we expect (tens of thousands)
+    this is still well under 100 ms on local Redis.
+    """
+    from gemma.session import GemmaSession
+
+    # We only need a Redis-connected store — namespace is irrelevant
+    # because the cache lives outside any namespace. Reuse the default
+    # factory so tests can still swap it out.
+    with GemmaSession(Config()) as session:
+        store = _store_factory(namespace="__cache__", redis_url=session._cfg.redis_url)
+        if store._client is None and session.redis_client is not None:
+            store._client = session.redis_client
+        info = store.embed_cache_stats(model=model)
+
+    table = Table(title="embed cache", show_header=False, pad_edge=False)
+    table.add_column("field", style="cyan")
+    table.add_column("value")
+    table.add_row("total keys", str(info["total_keys"]))
+    table.add_row("approx bytes", f"{info['approx_bytes']:,}")
+    per_model = info.get("per_model", {})
+    if per_model:
+        table.add_row(
+            "by model",
+            ", ".join(f"{m}={n}" for m, n in sorted(per_model.items())),
+        )
+    else:
+        table.add_row("by model", "—")
+    console.print(table)
+
+
+def cache_clear_command(
+    model: Optional[str] = typer.Option(
+        None, "--model",
+        help="Clear only keys for this model. Default: clear all cache keys.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Skip confirmation.",
+    ),
+) -> None:
+    """Drop entries from the content-hash embed cache.
+
+    Use when switching embedding models you no longer plan to revisit,
+    or when freeing Redis memory. Does NOT touch indexed chunks —
+    those live in the per-namespace store and are removed via
+    ``gemma rag reset``.
+    """
+    from gemma.session import GemmaSession
+
+    target = f"model={model}" if model else "all models"
     if not yes:
         confirm = typer.confirm(
-            f"clear namespace {store.namespace} for {root}?",
+            f"clear embed cache ({target})?",
             default=False,
         )
         if not confirm:
             console.print("[yellow]aborted.[/yellow]")
             raise typer.Exit(code=1)
 
-    deleted = store.clear_namespace()
-    console.print(f"cleared {deleted} keys for namespace [cyan]{store.namespace}[/cyan]")
+    with GemmaSession(Config()) as session:
+        store = _store_factory(namespace="__cache__", redis_url=session._cfg.redis_url)
+        if store._client is None and session.redis_client is not None:
+            store._client = session.redis_client
+        deleted = store.clear_embed_cache(model=model)
+    console.print(f"cleared {deleted} embed cache keys ({target})")

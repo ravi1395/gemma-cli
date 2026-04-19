@@ -68,9 +68,16 @@ class MemoryStore:
     unreachable, letting callers degrade gracefully instead of crashing.
     """
 
-    def __init__(self, config: Config, client: Optional[Any] = None):
+    def __init__(
+        self,
+        config: Config,
+        client: Optional[Any] = None,
+        *,
+        pool: Optional[Any] = None,
+    ):
         self._config = config
         self._client = client  # injected for tests (fakeredis)
+        self._pool = pool      # shared ConnectionPool from GemmaSession (#3)
         self._health_checked_at: float = 0.0
         self._healthy: bool = False
 
@@ -85,10 +92,16 @@ class MemoryStore:
                 self._healthy = False
                 return False
             try:
-                self._client = redis.Redis.from_url(
-                    self._config.redis_url,
-                    decode_responses=True,  # hashes return str, not bytes
-                )
+                if self._pool is not None:
+                    self._client = redis.Redis(
+                        connection_pool=self._pool,
+                        decode_responses=True,
+                    )
+                else:
+                    self._client = redis.Redis.from_url(
+                        self._config.redis_url,
+                        decode_responses=True,  # hashes return str, not bytes
+                    )
             except Exception:
                 self._healthy = False
                 return False

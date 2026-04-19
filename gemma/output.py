@@ -56,7 +56,7 @@ def render_response(
     stream: bool = True,
     field: Optional[str] = None,
     model: Optional[str] = None,
-) -> str:
+) -> Tuple[str, bool]:
     """Consume a response generator and render output according to *mode*.
 
     The generator yields ``(chunk_type, text)`` tuples where *chunk_type* is
@@ -72,22 +72,31 @@ def render_response(
         model:     Model tag included in JSON / ONLY output.
 
     Returns:
-        The full response text (content chunks joined; thinking excluded).
+        ``(reply, finished)`` where ``reply`` is the full response text
+        (content chunks joined; thinking excluded) and ``finished`` is
+        True only when the generator was exhausted cleanly. Stream-and-
+        cache (#6) gates ``cache.put`` on ``finished`` so an interrupted
+        stream never pollutes the cache with a truncated reply.
     """
     start = time.monotonic()
     chunks: list[str] = []
     thinking_parts: list[str] = []
+    finished = False
 
     if mode == OutputMode.RICH:
         # Streaming path — render inline as chunks arrive.
-        _render_rich(generator, stream, chunks, thinking_parts)
+        finished = _render_rich(generator, stream, chunks, thinking_parts)
     else:
         # Non-streaming: collect everything first, then render.
-        for chunk_type, text in generator:
-            if chunk_type == "think":
-                thinking_parts.append(text)
-            else:
-                chunks.append(text)
+        try:
+            for chunk_type, text in generator:
+                if chunk_type == "think":
+                    thinking_parts.append(text)
+                else:
+                    chunks.append(text)
+            finished = True
+        except Exception:
+            finished = False
 
     content = "".join(chunks)
     elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -99,7 +108,7 @@ def render_response(
     elif mode == OutputMode.CODE:
         _render_code(content)
 
-    return content
+    return content, finished
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +120,7 @@ def _render_rich(
     stream: bool,
     chunks: list[str],
     thinking_parts: list[str],
-) -> None:
+) -> bool:
     """Render in RICH mode (streaming or batched Markdown).
 
     Mutates *chunks* and *thinking_parts* in-place so the caller has the
@@ -122,34 +131,48 @@ def _render_rich(
         stream:        True → print each chunk as it arrives.
         chunks:        Accumulator for content chunks.
         thinking_parts: Accumulator for thinking chunks.
+
+    Returns:
+        True only when the generator was consumed cleanly to its end.
+        A mid-stream exception (network drop, ``generator.throw()``,
+        Ctrl-C) returns False so callers can skip cache writes (#6).
     """
     if stream:
         had_thinking = False
         first_content = True
-        for chunk_type, text in generator:
-            if chunk_type == "think":
-                if not had_thinking:
-                    console.print("[dim italic]thinking…[/dim italic]")
-                    had_thinking = True
-                console.print(text, end="", soft_wrap=True, highlight=False, style="dim italic")
-            else:
-                if had_thinking and first_content:
-                    console.print()  # newline after the last thinking chunk
-                    first_content = False
-                chunks.append(text)
-                console.print(text, end="", soft_wrap=True, highlight=False)
+        try:
+            for chunk_type, text in generator:
+                if chunk_type == "think":
+                    if not had_thinking:
+                        console.print("[dim italic]thinking…[/dim italic]")
+                        had_thinking = True
+                    console.print(text, end="", soft_wrap=True, highlight=False, style="dim italic")
+                else:
+                    if had_thinking and first_content:
+                        console.print()  # newline after the last thinking chunk
+                        first_content = False
+                    chunks.append(text)
+                    console.print(text, end="", soft_wrap=True, highlight=False)
+        except Exception:
+            console.print()
+            return False
         console.print()
+        return True
     else:
-        for chunk_type, text in generator:
-            if chunk_type == "think":
-                thinking_parts.append(text)
-            else:
-                chunks.append(text)
+        try:
+            for chunk_type, text in generator:
+                if chunk_type == "think":
+                    thinking_parts.append(text)
+                else:
+                    chunks.append(text)
+        except Exception:
+            return False
         if thinking_parts:
             console.rule("[dim]thinking[/dim]", style="dim")
             console.print("".join(thinking_parts), style="dim italic")
             console.rule(style="dim")
         console.print(Markdown("".join(chunks)))
+        return True
 
 
 def _render_json(content: str, model: Optional[str], elapsed_ms: int) -> None:

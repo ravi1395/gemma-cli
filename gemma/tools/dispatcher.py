@@ -19,6 +19,7 @@ high-level integration tests.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -26,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from gemma.tools import audit as _audit
 from gemma.tools import registry as _registry
 from gemma.tools.capabilities import Capability, GatingContext, gate
+from gemma.tools.planning import PlanRequested
 from gemma.tools.registry import ToolResult, ToolSpec
 
 
@@ -61,6 +63,14 @@ class Dispatcher:
     # its own so two concurrent dispatchers don't clobber each other.
     calls_made: int = 0
 
+    # Guards the ``calls_made`` read-modify-write against concurrent
+    # dispatch (#20 ThreadPoolExecutor). Without this lock a fan-out
+    # of N calls against a budget of M can let more than M through
+    # under high concurrency. Cheap: only held during the increment.
+    _budget_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
+
     # --------------------------------------------------------------
     # Public API
     # --------------------------------------------------------------
@@ -81,12 +91,15 @@ class Dispatcher:
         conversationally rather than the CLI crashing out.
         """
         # --- Budget check (before anything else so runaway loops stop early).
-        if self.calls_made >= self.budget:
-            return self._refuse(
-                name, args, reason="budget exhausted",
-                error="budget_exhausted",
-            )
-        self.calls_made += 1
+        # Atomic under concurrent dispatch via ``_budget_lock`` — otherwise
+        # a burst of N parallel calls could slip past a budget of M < N.
+        with self._budget_lock:
+            if self.calls_made >= self.budget:
+                return self._refuse(
+                    name, args, reason="budget exhausted",
+                    error="budget_exhausted",
+                )
+            self.calls_made += 1
 
         # --- Lookup.
         try:
@@ -132,6 +145,23 @@ class Dispatcher:
         started = time.monotonic()
         try:
             result = handler(**args)
+        except PlanRequested as plan_exc:
+            # Sentinel from the ``plan`` meta-tool (#19). Audit the
+            # entry — it is a legitimate, successful invocation from
+            # the dispatcher's point of view — and re-raise so the
+            # agent loop can switch into executor mode.
+            duration_ms = int((time.monotonic() - started) * 1000)
+            _audit.append(_audit.make_record(
+                tool=name,
+                capability=spec.capability.value,
+                args=args,
+                session_id=self.session_id,
+                exit_code=0,
+                duration_ms=duration_ms,
+                approved_by=approved_by,
+                refusal_reason=None,
+            ))
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             # Handlers shouldn't raise, but if one does, never let it
             # crash the CLI mid-turn.

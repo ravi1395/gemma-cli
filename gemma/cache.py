@@ -92,6 +92,46 @@ class ResponseCache:
         except Exception:
             pass
 
+    @classmethod
+    def eligible(
+        cls,
+        cfg: "Config",
+        *,
+        no_stream: bool,
+        no_cache: bool,
+        prebuilt: Optional["ResponseCache"] = None,
+    ) -> Optional["ResponseCache"]:
+        """Return a ResponseCache when the call is cache-eligible, else None.
+
+        A call is eligible when all four conditions hold:
+        * ``no_stream`` is True  — streaming responses cannot be cached.
+        * ``no_cache`` is False  — caller has not opted out.
+        * ``cfg.cache_enabled`` is True.
+        * ``cfg.temperature`` ≤ ``cfg.cache_temperature_max``.
+
+        When all conditions are met and ``prebuilt`` is supplied the
+        prebuilt cache is returned as-is (avoids opening a second Redis
+        connection when the caller already holds one from a GemmaSession).
+        Otherwise a fresh ResponseCache is built via :func:`build_cache`.
+
+        Args:
+            cfg:       Active Config for this invocation.
+            no_stream: True when the caller disabled streaming output.
+            no_cache:  True when the caller has opted out of the cache.
+            prebuilt:  Optional pre-connected ResponseCache to reuse.
+
+        Returns:
+            A ResponseCache (possibly prebuilt) or None.
+        """
+        if not (
+            no_stream
+            and not no_cache
+            and cfg.cache_enabled
+            and cfg.temperature <= cfg.cache_temperature_max
+        ):
+            return None
+        return prebuilt if prebuilt is not None else build_cache(cfg)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -134,7 +174,7 @@ class ResponseCache:
         return f"{_K_PREFIX}{sha}"
 
 
-def build_cache(config: "Config") -> Optional[ResponseCache]:
+def build_cache(config: "Config", *, pool: Optional[Any] = None) -> Optional[ResponseCache]:
     """Create a ResponseCache from config, or None if unavailable.
 
     Returns None (silently) when:
@@ -144,6 +184,9 @@ def build_cache(config: "Config") -> Optional[ResponseCache]:
 
     Args:
         config: Active Config with cache_enabled, cache_ttl_seconds, redis_url.
+        pool:   Optional shared :class:`redis.ConnectionPool` (#3). When
+                supplied the cache's client is built from the pool
+                instead of opening a new TCP connection.
 
     Returns:
         A connected ResponseCache, or None.
@@ -155,7 +198,10 @@ def build_cache(config: "Config") -> Optional[ResponseCache]:
     except ImportError:
         return None
     try:
-        client = _redis.Redis.from_url(config.redis_url, decode_responses=True)
+        if pool is not None:
+            client = _redis.Redis(connection_pool=pool, decode_responses=True)
+        else:
+            client = _redis.Redis.from_url(config.redis_url, decode_responses=True)
         client.ping()
         return ResponseCache(client, config.cache_ttl_seconds)
     except Exception:
