@@ -57,6 +57,14 @@ class Config:
     agent_max_turns: int = 8          # upper bound on tool-call turns per ask
     agent_tool_cache: bool = True     # enable per-session READ-tool memoization
 
+    # --- Web search tool (item #16) ---
+    # Pluggable backend selector — see gemma/tools/backends/ for the
+    # available implementations. ``duckduckgo`` requires no API key and
+    # ships with the ``[agent]`` optional extra (``ddgs`` package).
+    web_search_backend: str = "duckduckgo"
+    web_search_max_per_turn: int = 3   # soft cap on search calls per agent turn
+    web_search_timeout_s: int = 10     # wall-clock budget per backend call
+
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"

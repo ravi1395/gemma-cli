@@ -21,6 +21,7 @@ memory = [
 ]
 agent = [
     "trafilatura>=1.10",
+    "ddgs>=9.0",          # DuckDuckGo backend for web_search (item #16)
 ]
 dev = [
     "pytest>=8.0",
