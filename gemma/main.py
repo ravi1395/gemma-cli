@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import threading
 from typing import Any, Callable, Dict, List, Optional
 
 import typer
@@ -149,6 +150,78 @@ console = Console()
 
 
 # -----------------------------------------------------------------------------
+# Warm-start helpers (item #4)
+# -----------------------------------------------------------------------------
+#
+# On CLI startup we fire two short daemon threads — one nudges the chat
+# model into VRAM, one the embedding model — so the user's *real* request
+# doesn't pay the 1–8 s cold-load tax. Both helpers swallow every
+# exception: if Ollama is down, misconfigured, or the model isn't pulled,
+# the warm-up is a no-op and the foreground command owns the error
+# surface (much clearer than a warm-up stacktrace pointing at nothing).
+
+def _warm_ollama(cfg: Config) -> None:
+    """Best-effort warm-up of the chat model. Never raises into the foreground.
+
+    Uses ``num_predict=1`` so Ollama loads the weights and returns
+    immediately — we don't care about the token, only the side effect of
+    bringing the model resident. ``keep_alive`` mirrors the runtime config
+    so the eviction timer resets for the subsequent real request.
+    """
+    try:
+        import ollama
+
+        ollama.Client(host=cfg.ollama_host).chat(
+            model=cfg.model,
+            messages=[{"role": "user", "content": "_"}],
+            keep_alive=cfg.ollama_keep_alive,
+            options={"num_predict": 1, "temperature": 0.0},
+        )
+    except Exception:
+        # Intentional: warm-up is fire-and-forget. Logging here would
+        # produce noise for users without Ollama running who never ask
+        # for RAG/chat features.
+        pass
+
+
+def _warm_embedder(cfg: Config) -> None:
+    """Separate daemon: warm the embedding model.
+
+    Kept as its own thread (rather than chained after the chat warm-up)
+    so a slow chat load doesn't push the embed warm-up past the user's
+    first RAG call. On single-GPU boxes the two can contend; that's
+    acceptable because both still beat a cold load on the first real
+    request.
+    """
+    try:
+        import ollama
+
+        ollama.Client(host=cfg.ollama_host).embed(
+            model=cfg.embedding_model,
+            input=" ",
+        )
+    except Exception:
+        pass
+
+
+def _spawn_warm_start(cfg: Config) -> None:
+    """Spawn the two warm-up threads when the config allows.
+
+    Factored into its own function (rather than inlining in the callback)
+    so tests can monkey-patch either this seam or the individual helpers
+    without jumping through Typer.
+    """
+    if not cfg.warm_start or cfg.in_test_mode:
+        return
+    threading.Thread(
+        target=_warm_ollama, args=(cfg,), daemon=True, name="gemma-warm-chat"
+    ).start()
+    threading.Thread(
+        target=_warm_embedder, args=(cfg,), daemon=True, name="gemma-warm-embed"
+    ).start()
+
+
+# -----------------------------------------------------------------------------
 # Top-level callback — global flags (e.g. --profile) applied before subcommands
 # -----------------------------------------------------------------------------
 
@@ -167,6 +240,15 @@ def main_callback(
         # broken profiles dir never degrades the shell experience.
         autocompletion=profile_completer,
     ),
+    warm: Optional[bool] = typer.Option(
+        None,
+        "--warm/--no-warm",
+        help=(
+            "Warm Ollama's chat and embedding models in the background at "
+            "startup. On by default; pass --no-warm for scripted invocations "
+            "(e.g. 'gemma --no-warm history stats') that will never call Ollama."
+        ),
+    ),
 ) -> None:
     """gemma – local Gemma 4 CLI via Ollama."""
     global _active_profile
@@ -176,6 +258,15 @@ def main_callback(
         except FileNotFoundError as exc:
             console.print(f"[red]error: {exc}[/red]")
             raise typer.Exit(code=1)
+
+    # Resolve the config the same way _make_config does so warm-start honours
+    # both --profile and --warm/--no-warm without building the full CLI-override
+    # chain (the warm-up only needs ollama_host, model, embedding_model,
+    # ollama_keep_alive — none of the subcommand overrides).
+    cfg = dataclasses.replace(_active_profile) if _active_profile is not None else Config()
+    if warm is not None:
+        cfg = dataclasses.replace(cfg, warm_start=warm)
+    _spawn_warm_start(cfg)
 
 
 # -----------------------------------------------------------------------------

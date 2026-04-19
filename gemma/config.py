@@ -92,6 +92,20 @@ class Config:
     web_search_max_per_turn: int = 3   # soft cap on search calls per agent turn
     web_search_timeout_s: int = 10     # wall-clock budget per backend call
 
+    # --- Warm-start (item #4) ---
+    # When True, ``main_callback`` spawns two short-lived daemon threads at
+    # CLI startup: one issues a 1-token chat probe against ``cfg.model`` and
+    # the other calls ``embed`` against ``cfg.embedding_model``. Both carry
+    # ``cfg.ollama_keep_alive`` so Ollama retains the weights for the real
+    # request that follows. The cost when the models are already resident is
+    # a few ms of server load; the payoff when they have been evicted is the
+    # 1–8 s cold-load tax disappearing from the user's first ``ask``.
+    warm_start: bool = True
+    # Set to True inside ``tests/conftest.py`` so CliRunner invocations never
+    # accidentally spawn warm-up threads against a real Ollama. Production
+    # code leaves this at False; users should not need to touch it.
+    in_test_mode: bool = False
+
     # --- RAG indexer (items #9, #10) ---
     # Bounded parallelism for the embedding step of ``RAGIndexer``.
     # Each worker is given its *own* ``ollama.Client`` via
