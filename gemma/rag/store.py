@@ -80,6 +80,35 @@ def _k_file_chunks(ns: str, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Content-hash embedding cache (item #10)
+# ---------------------------------------------------------------------------
+#
+# The cache is deliberately **namespace-agnostic**: if two branches of
+# the same repo contain an identical chunk, they should both benefit
+# from one embedding. The version prefix (``v1``) lets us evolve the
+# ``embed_input`` format later without orphaning existing keys — bump
+# to ``v2`` and the old keys just time out via their TTL.
+#
+# Keys:
+#   gemma:rag:embed_cache:v1:{model}:{sha256(embed_input)} -> float32 bytes
+
+#: Pinned key prefix used by mget/mset helpers and by the CLI admin
+#: surface. Exported so scan-based cleanup tools can match it.
+EMBED_CACHE_PREFIX = "gemma:rag:embed_cache:v1"
+
+
+def _k_embed_cache(model: str, content_hash: str) -> str:
+    """Return the Redis key for one cached embedding.
+
+    ``model`` is embedded verbatim so a mixed-model install (e.g. a
+    profile that flipped to ``mxbai-embed-large``) doesn't silently
+    read vectors from the wrong encoder. ``content_hash`` is a 64-char
+    lowercase hex digest from sha256.
+    """
+    return f"{EMBED_CACHE_PREFIX}:{model}:{content_hash}"
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
 
@@ -513,6 +542,139 @@ class RedisVectorStore:
             sc.score = scored[cid]
             results.append(sc)
         return results, embeds
+
+    # ------------------------------------------------------------------
+    # Embedding cache (item #10)
+    # ------------------------------------------------------------------
+
+    def mget_embed_cache(
+        self, model: str, hashes: List[str],
+    ) -> List[Optional[np.ndarray]]:
+        """Bulk-fetch cached embeddings for a list of content hashes.
+
+        Always returns a list the same length as ``hashes``; entries
+        where the cache missed (or held a zero-length value) are
+        ``None``. Uses the binary client so Redis doesn't try to utf-8
+        decode float bytes.
+
+        Args:
+            model:  Embedding-model tag recorded in the key — keeps the
+                    cache honest across profile switches.
+            hashes: Lowercase hex digests (sha256) of ``embed_input``.
+        """
+        if not hashes:
+            return []
+        bc = self._binary_conn()
+        keys = [_k_embed_cache(model, h) for h in hashes]
+        raws = bc.mget(keys)
+        return [
+            np.frombuffer(r, dtype=np.float32) if r else None
+            for r in raws
+        ]
+
+    def mset_embed_cache(
+        self,
+        model: str,
+        vectors: Dict[str, np.ndarray],
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """Bulk-store embeddings keyed by content hash, optionally with TTL.
+
+        Writes happen in a single pipelined round-trip. Each vector is
+        serialised to its ``float32`` byte representation — callers can
+        reverse this with ``np.frombuffer(raw, dtype=np.float32)``.
+
+        Args:
+            model:       Embedding-model tag. Must match the one used
+                         by :meth:`mget_embed_cache` on the read side.
+            vectors:     ``{content_hash: vector}`` mapping. Empty
+                         input is a silent no-op.
+            ttl_seconds: Expiry for each key. ``None`` or ``<= 0``
+                         writes with no TTL (persist until evicted).
+        """
+        if not vectors:
+            return
+        bc = self._binary_conn()
+        pipe = bc.pipeline()
+        for content_hash, vec in vectors.items():
+            key = _k_embed_cache(model, content_hash)
+            raw = vec.astype(np.float32).tobytes()
+            if ttl_seconds and ttl_seconds > 0:
+                pipe.set(key, raw, ex=ttl_seconds)
+            else:
+                pipe.set(key, raw)
+        pipe.execute()
+
+    def embed_cache_stats(
+        self, model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a small summary of the embed cache.
+
+        Used by ``gemma rag cache stats`` — O(keys) under the hood
+        because we have to ``SCAN`` to count. For the cache sizes we
+        expect (tens of thousands of keys) this is still <100 ms.
+
+        Args:
+            model: If given, restricts the scan to keys for that
+                   specific model. Otherwise summarises across models.
+
+        Returns:
+            ``{"total_keys": int, "approx_bytes": int, "per_model":
+            {model: count}}``. ``approx_bytes`` is a fast
+            ``STRLEN`` sum — it omits Redis's own per-key overhead.
+        """
+        c = self._conn()
+        pattern = (
+            f"{EMBED_CACHE_PREFIX}:{model}:*"
+            if model
+            else f"{EMBED_CACHE_PREFIX}:*"
+        )
+        per_model: Dict[str, int] = {}
+        total_keys = 0
+        approx_bytes = 0
+        # Stream scan + STRLEN in a pipeline to bound RTTs.
+        for key in c.scan_iter(match=pattern, count=500):
+            total_keys += 1
+            # key looks like gemma:rag:embed_cache:v1:<model>:<hash>
+            parts = key.split(":", 5)
+            if len(parts) >= 6:
+                key_model = parts[4]
+                per_model[key_model] = per_model.get(key_model, 0) + 1
+            try:
+                approx_bytes += int(c.strlen(key))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return {
+            "total_keys": total_keys,
+            "approx_bytes": approx_bytes,
+            "per_model": per_model,
+        }
+
+    def clear_embed_cache(self, model: Optional[str] = None) -> int:
+        """Drop every embed-cache key, optionally filtered by model.
+
+        Uses ``scan_iter`` rather than ``KEYS`` so a huge cache doesn't
+        block the Redis server. Deletes are pipelined.
+
+        Args:
+            model: If given, restrict deletion to that model's keys.
+
+        Returns:
+            The number of keys actually deleted.
+        """
+        c = self._conn()
+        pattern = (
+            f"{EMBED_CACHE_PREFIX}:{model}:*"
+            if model
+            else f"{EMBED_CACHE_PREFIX}:*"
+        )
+        count = 0
+        pipe = c.pipeline()
+        for key in c.scan_iter(match=pattern, count=500):
+            pipe.delete(key)
+            count += 1
+        pipe.execute()
+        return count
 
     # ------------------------------------------------------------------
     # Admin

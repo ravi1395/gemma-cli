@@ -141,7 +141,18 @@ def index_command(
 
         console.print(f"indexing [bold]{root}[/bold] → namespace [cyan]{store.namespace}[/cyan]")
 
-        indexer = RAGIndexer(root=root, store=store, embedder=embedder)
+        # Item #9: each worker gets its own embedder so per-thread
+        # HTTP sessions don't serialise on a single keep-alive pool.
+        # Item #10: consult the content-hash embed cache before each
+        # call; cache_ttl is promoted from days → seconds here.
+        ttl_seconds = max(0, int(cfg.embed_cache_ttl_days)) * 24 * 3600
+        indexer = RAGIndexer(
+            root=root, store=store, embedder=embedder,
+            concurrency=cfg.embed_concurrency,
+            embedder_factory=lambda: _embedder_factory(cfg),
+            cache_enabled=cfg.embed_cache_enabled,
+            cache_ttl_seconds=ttl_seconds or None,
+        )
         stats = indexer.index(
             progress=lambda msg: console.print(f"· {msg}", style="dim"),
             force_hash=force_hash,
@@ -280,3 +291,88 @@ def reset_command(
 
         deleted = store.clear_namespace()
     console.print(f"cleared {deleted} keys for namespace [cyan]{store.namespace}[/cyan]")
+
+
+# ---------------------------------------------------------------------------
+# `gemma rag cache stats` / `gemma rag cache clear` (item #10)
+# ---------------------------------------------------------------------------
+#
+# The embed cache is namespace-agnostic (shared across repos and
+# branches because keys are content-addressable), so the admin surface
+# doesn't need a ``--root``. It does need ``--model`` since the cache
+# keys the model tag into every entry: switching encoders should not
+# require nuking vectors the old encoder can still use.
+
+def cache_stats_command(
+    model: Optional[str] = typer.Option(
+        None, "--model",
+        help="Restrict stats to one embedding model (default: all).",
+    ),
+) -> None:
+    """Report size and shape of the content-hash embed cache.
+
+    The scan is O(keys); for the sizes we expect (tens of thousands)
+    this is still well under 100 ms on local Redis.
+    """
+    from gemma.session import GemmaSession
+
+    # We only need a Redis-connected store — namespace is irrelevant
+    # because the cache lives outside any namespace. Reuse the default
+    # factory so tests can still swap it out.
+    with GemmaSession(Config()) as session:
+        store = _store_factory(namespace="__cache__", redis_url=session._cfg.redis_url)
+        if store._client is None and session.redis_client is not None:
+            store._client = session.redis_client
+        info = store.embed_cache_stats(model=model)
+
+    table = Table(title="embed cache", show_header=False, pad_edge=False)
+    table.add_column("field", style="cyan")
+    table.add_column("value")
+    table.add_row("total keys", str(info["total_keys"]))
+    table.add_row("approx bytes", f"{info['approx_bytes']:,}")
+    per_model = info.get("per_model", {})
+    if per_model:
+        table.add_row(
+            "by model",
+            ", ".join(f"{m}={n}" for m, n in sorted(per_model.items())),
+        )
+    else:
+        table.add_row("by model", "—")
+    console.print(table)
+
+
+def cache_clear_command(
+    model: Optional[str] = typer.Option(
+        None, "--model",
+        help="Clear only keys for this model. Default: clear all cache keys.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Skip confirmation.",
+    ),
+) -> None:
+    """Drop entries from the content-hash embed cache.
+
+    Use when switching embedding models you no longer plan to revisit,
+    or when freeing Redis memory. Does NOT touch indexed chunks —
+    those live in the per-namespace store and are removed via
+    ``gemma rag reset``.
+    """
+    from gemma.session import GemmaSession
+
+    target = f"model={model}" if model else "all models"
+    if not yes:
+        confirm = typer.confirm(
+            f"clear embed cache ({target})?",
+            default=False,
+        )
+        if not confirm:
+            console.print("[yellow]aborted.[/yellow]")
+            raise typer.Exit(code=1)
+
+    with GemmaSession(Config()) as session:
+        store = _store_factory(namespace="__cache__", redis_url=session._cfg.redis_url)
+        if store._client is None and session.redis_client is not None:
+            store._client = session.redis_client
+        deleted = store.clear_embed_cache(model=model)
+    console.print(f"cleared {deleted} embed cache keys ({target})")

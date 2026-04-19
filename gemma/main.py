@@ -60,6 +60,8 @@ from gemma.commands.shell import (
     why_command,
 )
 from gemma.commands.rag import (
+    cache_clear_command as rag_cache_clear_command,
+    cache_stats_command as rag_cache_stats_command,
     index_command as rag_index_command,
     query_command as rag_query_command,
     reset_command as rag_reset_command,
@@ -114,6 +116,15 @@ rag_app.command("index")(rag_index_command)
 rag_app.command("query")(rag_query_command)
 rag_app.command("status")(rag_status_command)
 rag_app.command("reset")(rag_reset_command)
+
+# Item #10 — admin surface for the content-hash embed cache. Grouped
+# under ``gemma rag cache`` so ``stats`` and ``clear`` stay together
+# without polluting the top-level ``rag`` namespace.
+rag_cache_app = typer.Typer(help="Inspect or clear the embedding cache.")
+rag_cache_app.command("stats")(rag_cache_stats_command)
+rag_cache_app.command("clear")(rag_cache_clear_command)
+rag_app.add_typer(rag_cache_app, name="cache")
+
 app.add_typer(rag_app, name="rag")
 
 # Active profile set by --profile flag in the top-level callback.

@@ -92,6 +92,25 @@ class Config:
     web_search_max_per_turn: int = 3   # soft cap on search calls per agent turn
     web_search_timeout_s: int = 10     # wall-clock budget per backend call
 
+    # --- RAG indexer (items #9, #10) ---
+    # Bounded parallelism for the embedding step of ``RAGIndexer``.
+    # Each worker is given its *own* ``ollama.Client`` via
+    # ``RAGIndexer._embedder_factory`` so requests don't serialise on a
+    # shared HTTP session. Shipped at 1 (serial) so rollout is
+    # observational; flip to 2 per-profile once field measurements land.
+    # A value of 1 bypasses ``ThreadPoolExecutor`` entirely, preserving
+    # the micro-benchmarked serial baseline.
+    embed_concurrency: int = 1
+    # Content-addressable cache of embed vectors keyed by
+    # sha256(embed_input). Skipping an embed call is O(100 µs) vs.
+    # O(30 ms) for a real Ollama round-trip, so this is the single
+    # largest win on branch switches and reset+reindex.
+    embed_cache_enabled: bool = True
+    # TTL for cached embed vectors. 30 days keeps stale vectors from
+    # accumulating forever while comfortably covering a sprint's worth
+    # of reindex cycles on the same content.
+    embed_cache_ttl_days: int = 30
+
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
