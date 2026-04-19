@@ -3,9 +3,14 @@
 Defines the Config dataclass which holds all tunable parameters for the CLI
 and (in later phases) the memory system. Kept as a plain dataclass so it is
 easy to inspect, override via CLI flags, or extend.
+
+Profile support: named TOML files at ~/.config/gemma/profiles/<name>.toml can
+override any Config field. Load them with Config.load_profile(name) or via the
+top-level --profile CLI flag.
 """
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +48,11 @@ class Config:
     # Keeps TTFT low across repeated CLI invocations in the same shell session.
     ollama_keep_alive: str = "30m"
 
+    # --- Response cache ---
+    cache_enabled: bool = True
+    cache_ttl_seconds: int = 3600          # 0 = disable caching
+    cache_temperature_max: float = 0.3     # skip caching above this temperature
+
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
@@ -66,3 +76,59 @@ class Config:
         # Clamp importance to the valid range before lookup
         bucket = max(1, min(5, int(importance)))
         return self.ttl_map.get(bucket)
+
+    @classmethod
+    def from_toml(cls, path: Path) -> "Config":
+        """Load a Config from a TOML file, falling back to defaults for any missing field.
+
+        Unknown keys in the TOML file emit a UserWarning (forward-compatibility).
+
+        Args:
+            path: Absolute or relative path to a readable .toml file.
+
+        Returns:
+            A Config with TOML values overlaid on dataclass defaults.
+        """
+        try:
+            import tomllib  # stdlib, Python 3.11+
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Profile support requires Python 3.11+ (stdlib tomllib). "
+                "Upgrade Python or install the 'tomli' back-port."
+            ) from exc
+
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+
+        valid = {f.name for f in fields(cls)}
+        for key in data:
+            if key not in valid:
+                warnings.warn(
+                    f"gemma profile {path}: unknown field {key!r} — ignored",
+                    stacklevel=2,
+                )
+
+        known = {k: v for k, v in data.items() if k in valid}
+        return cls(**known)
+
+    @classmethod
+    def load_profile(cls, name: str) -> "Config":
+        """Load a named profile from ~/.config/gemma/profiles/<name>.toml.
+
+        Args:
+            name: Profile name (no extension). Maps to
+                  ~/.config/gemma/profiles/<name>.toml.
+
+        Returns:
+            A Config populated from the profile file.
+
+        Raises:
+            FileNotFoundError: If the profile file does not exist.
+        """
+        profile_path = Path.home() / ".config" / "gemma" / "profiles" / f"{name}.toml"
+        if not profile_path.exists():
+            raise FileNotFoundError(
+                f"Profile {name!r} not found. "
+                f"Expected file: {profile_path}"
+            )
+        return cls.from_toml(profile_path)

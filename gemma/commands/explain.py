@@ -27,6 +27,7 @@ import typer
 from rich.console import Console
 from rich.markdown import Markdown
 
+from gemma.cache import build_cache
 from gemma.client import chat as client_chat
 from gemma.config import Config
 from gemma.memory import MemoryManager
@@ -84,6 +85,11 @@ def explain_command(
     no_stream: bool = typer.Option(False, "--no-stream"),
     model: Optional[str] = typer.Option(None, "--model", "-m"),
     keep_alive: Optional[str] = typer.Option(None, "--keep-alive"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the response cache."),
+    cache_only: bool = typer.Option(
+        False, "--cache-only",
+        help="Error if no cache hit (requires --no-stream).",
+    ),
 ) -> None:
     """Explain text, a file, a command, or an error in plain English."""
 
@@ -163,6 +169,27 @@ def explain_command(
     # Stream / collect response
     # ------------------------------------------------------------------
     stream = not no_stream
+
+    # Cache path: only applicable for non-streaming calls within the
+    # configured temperature threshold.
+    cache = (
+        build_cache(cfg)
+        if (not stream and not no_cache and cfg.cache_enabled
+                and cfg.temperature <= cfg.cache_temperature_max)
+        else None
+    )
+    cached_content: Optional[str] = cache.get(messages, cfg) if cache else None
+
+    if cached_content is not None:
+        console.print(Markdown(cached_content))
+        return
+
+    if cache_only and not stream:
+        err_console.print(
+            "[red]gemma explain: no cache hit and --cache-only was set.[/red]"
+        )
+        raise typer.Exit(code=1)
+
     chunks: list[str] = []
 
     try:
@@ -180,3 +207,7 @@ def explain_command(
     except Exception as exc:
         err_console.print(f"[red]gemma explain: model error — {exc}[/red]")
         raise typer.Exit(code=1)
+
+    # Store the collected non-streaming response in cache.
+    if cache and chunks and not stream:
+        cache.put(messages, cfg, "".join(chunks))

@@ -305,3 +305,46 @@ Gemma 4 E4B can produce long responses. Streaming prints tokens as generated, gi
 
 **Why JSON history over SQLite?**
 Simplicity for a learning project. Easy to inspect, edit, or clear manually. SQLite would be the right call if adding named sessions or search.
+
+---
+
+## Phase 6 — Architectural Expansions
+
+Four independent features, planned as separate documents under `docs/plans/`
+with paired ADRs under `docs/adr/`. They share three new cross-cutting
+modules (`gemma/platform.py`, `gemma/safety.py`, `gemma/chunking.py`) that
+are built first so each feature reuses them instead of duplicating logic.
+
+| # | Feature | Plan | ADR | Effort | Risk |
+|---|---------|------|-----|--------|------|
+| 6.1 | Sandboxed tool use | [docs/plans/phase-6.1-sandboxed-tools.md](docs/plans/phase-6.1-sandboxed-tools.md) | [docs/adr/0001-tool-sandboxing.md](docs/adr/0001-tool-sandboxing.md) | High | Medium |
+| 6.2 | Local-directory RAG | [docs/plans/phase-6.2-local-rag.md](docs/plans/phase-6.2-local-rag.md) | [docs/adr/0002-local-rag.md](docs/adr/0002-local-rag.md) | High | Medium |
+| 6.3 | Shell completions | [docs/plans/phase-6.3-completions.md](docs/plans/phase-6.3-completions.md) | [docs/adr/0003-shell-completions.md](docs/adr/0003-shell-completions.md) | Low | Low |
+| 6.4 | Clipboard integration | [docs/plans/phase-6.4-clipboard.md](docs/plans/phase-6.4-clipboard.md) | [docs/adr/0004-clipboard.md](docs/adr/0004-clipboard.md) | Low | Low |
+
+### Shared modules (build first)
+
+- **`gemma/platform.py`** — OS + shell + TTY + SSH detection. Consumed by
+  6.3 (picks rc-file path) and 6.4 (picks clipboard backend).
+- **`gemma/safety.py`** — path allowlist, traversal/symlink-escape guards,
+  `archive()` helper that moves a path to `<root>/archive/<ISO-ts>/…` per
+  the project's never-delete rule. Consumed by 6.1 and reusable by the
+  existing `git` and `shell` commands.
+- **`gemma/chunking.py`** — AST chunking for `.py`, heading chunking for
+  `.md`, sliding-window fallback for everything else. Consumed by 6.2 and
+  reusable by memory condensation in future passes.
+
+### Execution order
+
+1. `platform.py` + `safety.py` + `chunking.py` (shared foundations).
+2. **6.4 Clipboard** — smallest, validates the platform layer.
+3. **6.3 Completions** — reuses platform layer, idempotent install.
+4. **6.2 RAG** — largest reuse win once chunking lands.
+5. **6.1 Sandboxed tools** — built on battle-tested `safety.py`.
+
+### Safety invariant (applies across Phase 6)
+
+> Gemma must never delete a file. The tool registry has no `delete`
+> capability; the only destructive-looking tool is `archive`, which moves
+> a path to `<cwd>/archive/<ISO-ts>/…`. This is enforced in code, not in
+> prompts.

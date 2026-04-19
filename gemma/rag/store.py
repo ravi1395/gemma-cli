@@ -1,0 +1,434 @@
+"""Redis-backed vector store for RAG chunks.
+
+Design choice: **plain Redis + client-side cosine**
+---------------------------------------------------
+We deliberately do NOT use RediSearch's ``FT.SEARCH``/HNSW. Reasons:
+
+1. The memory subsystem already keeps embeddings as raw numpy bytes
+   and computes cosine in Python (see :mod:`gemma.memory.store`). Using
+   the same approach for RAG means users only need ``redis:7``, not
+   ``redis-stack``.
+2. ``fakeredis`` supports every command we use here (HSET/SADD/SMEMBERS/
+   DEL/GET/HMGET) but does not support RediSearch — reusing the same
+   pattern keeps the test suite hermetic.
+3. For the sizes we expect in a single repo (roughly 10k–100k chunks,
+   768-dim float32 → ~300 MB worst case), a client-side cosine against
+   pre-normalised vectors is dominated by NumPy BLAS and runs in tens
+   of milliseconds. The operational complexity of RediSearch isn't
+   worth it at this scale.
+
+Key layout
+----------
+All keys are scoped to a namespace returned by
+:func:`gemma.rag.namespace.resolve_namespace` so two repos (or two
+branches) never share state::
+
+    gemma:rag:{ns}:index                    SET    all active chunk_ids
+    gemma:rag:{ns}:chunk:{chunk_id}         HASH   chunk metadata+text
+    gemma:rag:{ns}:embed:{chunk_id}         STR    float32 bytes (no nulls)
+    gemma:rag:{ns}:manifest                 HASH   path -> JSON FileEntry
+    gemma:rag:{ns}:meta                     HASH   {dim, model, last_indexed_at}
+    gemma:rag:{ns}:file_chunks:{path_key}   SET    chunk_ids for that path
+
+``file_chunks`` is a reverse index: when a file is removed or replaced,
+we need to find and delete every chunk that came from it. Storing a
+per-file set avoids scanning the whole index on every delete.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+
+try:
+    import redis  # type: ignore
+except ImportError:  # pragma: no cover -- redis is a declared dep
+    redis = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Key helpers
+# ---------------------------------------------------------------------------
+
+def _k_index(ns: str) -> str:
+    return f"gemma:rag:{ns}:index"
+
+
+def _k_chunk(ns: str, cid: str) -> str:
+    return f"gemma:rag:{ns}:chunk:{cid}"
+
+
+def _k_embed(ns: str, cid: str) -> str:
+    return f"gemma:rag:{ns}:embed:{cid}"
+
+
+def _k_manifest(ns: str) -> str:
+    return f"gemma:rag:{ns}:manifest"
+
+
+def _k_meta(ns: str) -> str:
+    return f"gemma:rag:{ns}:meta"
+
+
+def _k_file_chunks(ns: str, path: str) -> str:
+    # Path is already the POSIX-relative form used in the manifest; we
+    # embed it verbatim. Redis keys are binary-safe so slashes are fine.
+    return f"gemma:rag:{ns}:file_chunks:{path}"
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StoredChunk:
+    """A chunk as it comes back from the store.
+
+    Mirrors :class:`gemma.chunking.Chunk` but with an additional
+    ``score`` field populated by :meth:`RedisVectorStore.search`.
+    """
+
+    id: str
+    path: str
+    start_line: int
+    end_line: int
+    text: str
+    header: Optional[str]
+    score: float = 0.0
+
+    @property
+    def line_range(self) -> str:
+        if self.start_line == self.end_line:
+            return str(self.start_line)
+        return f"{self.start_line}-{self.end_line}"
+
+
+# ---------------------------------------------------------------------------
+# RedisVectorStore
+# ---------------------------------------------------------------------------
+
+class RedisVectorStore:
+    """Stores chunks + embeddings in Redis, scored client-side.
+
+    The store is namespace-scoped: one instance corresponds to one
+    ``{root_hash}:{branch}`` workspace. Callers construct a new store
+    when switching workspaces.
+    """
+
+    def __init__(
+        self,
+        namespace: str,
+        redis_url: str = "redis://localhost:6379/0",
+        *,
+        client: Optional[Any] = None,
+    ):
+        """Wire up the store.
+
+        Args:
+            namespace: Namespace from :func:`resolve_namespace`.
+            redis_url: Used to build a real client when ``client`` is None.
+            client:    Pre-built Redis client. Tests inject ``fakeredis``
+                       here; production code lets us build our own.
+
+        Note: Redis clients must be constructed with
+        ``decode_responses=True`` so ``hgetall`` returns ``str``
+        keys/values. Embeddings are the one binary payload we store —
+        we fetch those via a separately-built binary client.
+        """
+        self._namespace = namespace
+        self._redis_url = redis_url
+        self._client = client
+        self._binary_client: Optional[Any] = None
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    def _conn(self) -> Any:
+        """Return the decode_responses=True client, lazily built."""
+        if self._client is None:
+            if redis is None:
+                raise RuntimeError(
+                    "redis-py not installed. RAG requires the 'memory' extra."
+                )
+            self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+        return self._client
+
+    def _binary_conn(self) -> Any:
+        """Return a client with ``decode_responses=False`` for embedding bytes.
+
+        Two clients are needed because a single client can't decode
+        some responses and pass others through. We cache the binary
+        client for the life of the store.
+        """
+        if self._binary_client is None:
+            if self._client is not None and hasattr(self._client, "connection_pool"):
+                # Reuse the same pool when possible (real redis-py). For
+                # fakeredis, fall through to the else branch which
+                # assumes the fakeredis client can be used as-is with
+                # bytes by calling the ``*_byte`` flavoured methods we
+                # use explicitly below.
+                try:
+                    self._binary_client = type(self._client)(
+                        connection_pool=self._client.connection_pool,
+                        decode_responses=False,
+                    )
+                except TypeError:
+                    # fakeredis doesn't accept connection_pool kwarg.
+                    self._binary_client = self._client
+            elif redis is None:
+                raise RuntimeError("redis-py not installed. RAG requires the 'memory' extra.")
+            else:
+                self._binary_client = redis.Redis.from_url(
+                    self._redis_url, decode_responses=False,
+                )
+        return self._binary_client
+
+    # ------------------------------------------------------------------
+    # Writes
+    # ------------------------------------------------------------------
+
+    def upsert_chunk(
+        self,
+        chunk_id: str,
+        *,
+        path: str,
+        start_line: int,
+        end_line: int,
+        text: str,
+        header: Optional[str],
+        embedding: np.ndarray,
+    ) -> None:
+        """Insert or replace a single chunk.
+
+        The embedding is stored as raw ``float32`` bytes. Callers should
+        L2-normalise vectors **before** upserting so :meth:`search` can
+        skip normalisation in its hot loop; the indexer does this.
+        """
+        c = self._conn()
+        bc = self._binary_conn()
+
+        c.hset(
+            _k_chunk(self._namespace, chunk_id),
+            mapping={
+                "path": path,
+                "start_line": str(start_line),
+                "end_line": str(end_line),
+                "text": text,
+                "header": header or "",
+            },
+        )
+        # Raw bytes — use the binary client so decode_responses doesn't
+        # try to utf-8 decode non-text floats.
+        bc.set(_k_embed(self._namespace, chunk_id), embedding.astype(np.float32).tobytes())
+
+        c.sadd(_k_index(self._namespace), chunk_id)
+        c.sadd(_k_file_chunks(self._namespace, path), chunk_id)
+
+    def delete_chunk(self, chunk_id: str) -> None:
+        """Delete a single chunk and its embedding.
+
+        We fetch the chunk's ``path`` first so we can also evict it
+        from the per-file reverse index. If the chunk is already gone,
+        this is a no-op.
+        """
+        c = self._conn()
+        bc = self._binary_conn()
+        path = c.hget(_k_chunk(self._namespace, chunk_id), "path")
+        c.delete(_k_chunk(self._namespace, chunk_id))
+        bc.delete(_k_embed(self._namespace, chunk_id))
+        c.srem(_k_index(self._namespace), chunk_id)
+        if path:
+            c.srem(_k_file_chunks(self._namespace, path), chunk_id)
+
+    def delete_file(self, path: str) -> int:
+        """Remove every chunk whose source file is ``path``.
+
+        Returns the number of chunks deleted — useful for telemetry
+        on the removed/changed branches of the indexer.
+        """
+        c = self._conn()
+        chunks = list(c.smembers(_k_file_chunks(self._namespace, path)))
+        for cid in chunks:
+            self.delete_chunk(cid)
+        c.delete(_k_file_chunks(self._namespace, path))
+        return len(chunks)
+
+    # ------------------------------------------------------------------
+    # Manifest / meta
+    # ------------------------------------------------------------------
+
+    def load_manifest_hash(self) -> Dict[str, str]:
+        c = self._conn()
+        return dict(c.hgetall(_k_manifest(self._namespace)))
+
+    def save_manifest_hash(self, blobs: Dict[str, str]) -> None:
+        """Replace the manifest hash atomically.
+
+        We delete-then-set rather than upserting field-by-field because
+        a file that was removed from the workspace must also leave the
+        manifest — and ``hset`` has no "replace the whole hash"
+        semantic.
+        """
+        c = self._conn()
+        key = _k_manifest(self._namespace)
+        pipe = c.pipeline()
+        pipe.delete(key)
+        if blobs:
+            pipe.hset(key, mapping=blobs)
+        pipe.execute()
+
+    def set_meta(self, dim: int, model: str) -> None:
+        """Record the embedding-model fingerprint for the namespace.
+
+        If a future index run uses a different model or dimension we
+        can spot the drift and (caller's decision) clear the namespace
+        rather than mix incompatible vectors.
+        """
+        c = self._conn()
+        c.hset(
+            _k_meta(self._namespace),
+            mapping={
+                "dim": str(dim),
+                "model": model,
+                "last_indexed_at": str(int(time.time())),
+            },
+        )
+
+    def get_meta(self) -> Dict[str, str]:
+        c = self._conn()
+        return dict(c.hgetall(_k_meta(self._namespace)))
+
+    # ------------------------------------------------------------------
+    # Read helpers
+    # ------------------------------------------------------------------
+
+    def chunk_count(self) -> int:
+        c = self._conn()
+        return int(c.scard(_k_index(self._namespace)))
+
+    def all_chunk_ids(self) -> List[str]:
+        c = self._conn()
+        return list(c.smembers(_k_index(self._namespace)))
+
+    def get_chunk(self, chunk_id: str) -> Optional[StoredChunk]:
+        """Fetch a chunk's metadata (sans embedding)."""
+        c = self._conn()
+        row = c.hgetall(_k_chunk(self._namespace, chunk_id))
+        if not row:
+            return None
+        return StoredChunk(
+            id=chunk_id,
+            path=row.get("path", ""),
+            start_line=int(row.get("start_line", 0) or 0),
+            end_line=int(row.get("end_line", 0) or 0),
+            text=row.get("text", ""),
+            header=row.get("header") or None,
+        )
+
+    def get_embedding(self, chunk_id: str) -> Optional[np.ndarray]:
+        """Fetch one embedding. Returns None if the chunk is absent."""
+        bc = self._binary_conn()
+        raw = bc.get(_k_embed(self._namespace, chunk_id))
+        if not raw:
+            return None
+        return np.frombuffer(raw, dtype=np.float32)
+
+    def load_all_embeddings(self) -> Dict[str, np.ndarray]:
+        """Bulk-fetch every embedding for in-process cosine scoring.
+
+        For 10k chunks × 768-dim × 4-byte floats this is ~30 MB, which
+        we're comfortable holding in RAM. Callers wanting to bound
+        memory should page via a future ``search_paginated`` variant.
+        """
+        bc = self._binary_conn()
+        cids = self.all_chunk_ids()
+        if not cids:
+            return {}
+
+        # MGET in a single round-trip. Redis keys, not chunk IDs, go on
+        # the wire; we reassemble the dict on our side.
+        keys = [_k_embed(self._namespace, cid) for cid in cids]
+        raws = bc.mget(keys)
+        out: Dict[str, np.ndarray] = {}
+        for cid, raw in zip(cids, raws):
+            if raw:
+                out[cid] = np.frombuffer(raw, dtype=np.float32)
+        return out
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def search(
+        self, query: np.ndarray, k: int = 5,
+    ) -> List[StoredChunk]:
+        """Return the top ``k`` chunks by cosine similarity.
+
+        The query is normalised here so callers don't have to remember.
+        Stored embeddings are normalised at upsert time, so the cosine
+        of two L2-normalised vectors is just their dot product — fast
+        and branch-free.
+        """
+        if query.size == 0:
+            return []
+
+        q = query.astype(np.float32)
+        qnorm = float(np.linalg.norm(q))
+        if qnorm == 0.0:
+            return []
+        q = q / qnorm
+
+        embeds = self.load_all_embeddings()
+        if not embeds:
+            return []
+
+        cids = list(embeds.keys())
+        matrix = np.stack([embeds[c] for c in cids], axis=0)  # (N, D)
+        # Dot product against pre-normalised vectors. Cheap and exact.
+        scores = matrix @ q
+
+        # Pick top k without sorting the full array.
+        if k >= len(cids):
+            top_idx = np.argsort(-scores)
+        else:
+            top_idx = np.argpartition(-scores, k)[:k]
+            top_idx = top_idx[np.argsort(-scores[top_idx])]
+
+        results: List[StoredChunk] = []
+        for i in top_idx:
+            cid = cids[int(i)]
+            sc = self.get_chunk(cid)
+            if sc is None:
+                continue
+            sc.score = float(scores[int(i)])
+            results.append(sc)
+        return results
+
+    # ------------------------------------------------------------------
+    # Admin
+    # ------------------------------------------------------------------
+
+    def clear_namespace(self) -> int:
+        """Nuke every RAG key for this namespace.
+
+        Returns the number of keys deleted. Used by ``gemma rag reset``
+        (future) and by tests that want a clean slate.
+        """
+        c = self._conn()
+        pattern = f"gemma:rag:{self._namespace}:*"
+        # scan_iter so we don't block the server on huge namespaces.
+        count = 0
+        pipe = c.pipeline()
+        for key in c.scan_iter(match=pattern, count=500):
+            pipe.delete(key)
+            count += 1
+        pipe.execute()
+        return count

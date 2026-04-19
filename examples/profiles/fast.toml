@@ -1,0 +1,9 @@
+# Fast profile — smallest model, pinned in RAM, minimal memory overhead
+# gemma --profile fast ask "quick question"
+# gemma --profile fast pipe "summarize this"
+
+model = "gemma4:e4b"
+system_prompt = "You are a concise assistant. Answer in as few words as possible."
+temperature = 0.3
+memory_top_k = 2
+ollama_keep_alive = "-1"

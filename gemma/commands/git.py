@@ -23,7 +23,9 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from gemma.cache import build_cache
 from gemma.client import chat as client_chat
+from gemma.commands.clipboard import handle_copy_flags
 from gemma.config import Config
 
 
@@ -132,6 +134,23 @@ def commit_command(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h').",
     ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the response cache."),
+    cache_only: bool = typer.Option(
+        False, "--cache-only",
+        help="Error if no cache hit (useful for verifying cached state).",
+    ),
+    copy: bool = typer.Option(
+        False, "--copy",
+        help="Copy the generated commit message to the system clipboard.",
+    ),
+    copy_tee: bool = typer.Option(
+        False, "--copy-tee",
+        help="Print the message AND copy it to the clipboard.",
+    ),
+    allow_secrets: bool = typer.Option(
+        False, "--allow-secrets",
+        help="Allow clipboard copy even if secrets are detected in the output.",
+    ),
 ) -> None:
     """Generate a conventional-commit message from staged changes.
 
@@ -178,21 +197,47 @@ def commit_command(
         {"role": "user", "content": user_msg},
     ]
 
-    raw_parts: list[str] = []
-    try:
-        for _chunk_type, text in client_chat(messages, cfg, stream=False):
-            raw_parts.append(text)
-    except Exception as exc:
-        err_console.print(f"[red]gemma commit: model error — {exc}[/red]")
-        raise typer.Exit(code=1)
+    # Cache path: commit always runs at temperature 0.2, well within threshold.
+    cache = (
+        build_cache(cfg)
+        if (not no_cache and cfg.cache_enabled and cfg.temperature <= cfg.cache_temperature_max)
+        else None
+    )
+    commit_msg: Optional[str] = cache.get(messages, cfg) if cache else None
 
-    commit_msg = "".join(raw_parts).strip()
+    if commit_msg is None:
+        if cache_only:
+            err_console.print(
+                "[red]gemma commit: no cache hit and --cache-only was set.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        raw_parts: list[str] = []
+        try:
+            for _chunk_type, text in client_chat(messages, cfg, stream=False):
+                raw_parts.append(text)
+        except Exception as exc:
+            err_console.print(f"[red]gemma commit: model error — {exc}[/red]")
+            raise typer.Exit(code=1)
+
+        commit_msg = "".join(raw_parts).strip()
+        if cache and commit_msg:
+            cache.put(messages, cfg, commit_msg)
+
     if not commit_msg:
         err_console.print("[yellow]gemma commit: model returned an empty response.[/yellow]")
         raise typer.Exit(code=1)
 
     # Display the generated message for review.
     console.print(Panel(commit_msg, title="[bold cyan]gemma commit[/bold cyan]", border_style="cyan"))
+
+    # Clipboard integration runs before --apply so the message is on the
+    # clipboard regardless of whether the user auto-creates the commit.
+    handle_copy_flags(
+        commit_msg,
+        copy=copy, copy_tee=copy_tee,
+        allow_secrets=allow_secrets, tool_name="commit",
+    )
 
     if not apply:
         console.print("[dim]Tip: pass --apply to create the commit automatically.[/dim]")
@@ -239,6 +284,23 @@ def diff_command(
     keep_alive: Optional[str] = typer.Option(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h').",
+    ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the response cache."),
+    cache_only: bool = typer.Option(
+        False, "--cache-only",
+        help="Error if no cache hit (useful for verifying cached state).",
+    ),
+    copy: bool = typer.Option(
+        False, "--copy",
+        help="Copy the diff summary to the system clipboard.",
+    ),
+    copy_tee: bool = typer.Option(
+        False, "--copy-tee",
+        help="Print the summary AND copy it to the clipboard.",
+    ),
+    allow_secrets: bool = typer.Option(
+        False, "--allow-secrets",
+        help="Allow clipboard copy even if secrets are detected in the output.",
     ),
 ) -> None:
     """Summarize git diff output in plain English.
@@ -287,17 +349,40 @@ def diff_command(
         {"role": "user", "content": f"Summarize this diff:\n\n{diff}"},
     ]
 
-    parts: list[str] = []
-    try:
-        for _chunk_type, text in client_chat(messages, cfg, stream=False):
-            parts.append(text)
-    except Exception as exc:
-        err_console.print(f"[red]gemma diff: model error — {exc}[/red]")
-        raise typer.Exit(code=1)
+    # Cache path: diff runs at temperature 0.3, at the threshold boundary.
+    cache = (
+        build_cache(cfg)
+        if (not no_cache and cfg.cache_enabled and cfg.temperature <= cfg.cache_temperature_max)
+        else None
+    )
+    summary: Optional[str] = cache.get(messages, cfg) if cache else None
 
-    summary = "".join(parts).strip()
+    if summary is None:
+        if cache_only:
+            err_console.print(
+                "[red]gemma diff: no cache hit and --cache-only was set.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        parts: list[str] = []
+        try:
+            for _chunk_type, text in client_chat(messages, cfg, stream=False):
+                parts.append(text)
+        except Exception as exc:
+            err_console.print(f"[red]gemma diff: model error — {exc}[/red]")
+            raise typer.Exit(code=1)
+
+        summary = "".join(parts).strip()
+        if cache and summary:
+            cache.put(messages, cfg, summary)
+
     if not summary:
         err_console.print("[yellow]gemma diff: model returned an empty response.[/yellow]")
         raise typer.Exit(code=1)
 
     console.print(summary)
+    handle_copy_flags(
+        summary,
+        copy=copy, copy_tee=copy_tee,
+        allow_secrets=allow_secrets, tool_name="diff",
+    )

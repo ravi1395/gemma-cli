@@ -289,6 +289,128 @@ class MemoryManager:
             "window_turns": self._store.get_turn_count(self._session_id),
         }
 
+    def add_memory(
+        self,
+        content: str,
+        *,
+        category: "MemoryCategory" = None,
+        importance: int = 4,
+    ) -> str:
+        """Persist a fact directly without the condensation pipeline.
+
+        Embeds ``content`` via the configured Embedder, saves the resulting
+        MemoryRecord to the store, and returns the assigned memory_id so the
+        caller can reference it later for ``pin``/``forget`` operations.
+
+        Args:
+            content:    The fact text to store.
+            category:   MemoryCategory for the record (default FACTUAL_CONTEXT).
+            importance: Importance tier 1-5 (default 4, clamped by MemoryRecord).
+
+        Returns:
+            The UUID string assigned as memory_id.
+
+        Raises:
+            RuntimeError: if the memory system is unavailable (Redis unreachable).
+        """
+        from gemma.memory.models import MemoryCategory as _MemoryCategory
+
+        if category is None:
+            category = _MemoryCategory.FACTUAL_CONTEXT
+
+        if not self.available:
+            raise RuntimeError(
+                "Memory system unavailable (Redis not reachable)."
+            )
+
+        rec = MemoryRecord(
+            content=content,
+            category=category,
+            importance=importance,
+            session_id=self._session_id,
+        )
+        try:
+            vec = self._embedder.embed(rec.content)
+        except Exception:
+            vec = None
+        self._store.save_memory(rec)
+        if vec is not None and vec.size > 0:
+            self._store.save_embedding(rec.memory_id, vec)
+        return rec.memory_id
+
+    def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
+        """Load a single MemoryRecord by ID without bumping access stats.
+
+        Args:
+            memory_id: UUID string of the memory to load.
+
+        Returns:
+            The MemoryRecord if found and active, otherwise None.
+        """
+        if not self.available:
+            return None
+        return self._store.get_memory(memory_id, bump_access=False)
+
+    def get_latest_memory(self) -> Optional[MemoryRecord]:
+        """Return the most recently created active memory.
+
+        Used by ``gemma forget --last`` to resolve the deletion target.
+
+        Returns:
+            The MemoryRecord with the highest ``created_at`` value, or None if
+            there are no active memories.
+        """
+        if not self.available:
+            return None
+        records = self._store.get_all_active_memories()
+        if not records:
+            return None
+        return max(records, key=lambda r: r.created_at)
+
+    def forget_memory(self, memory_id: str) -> bool:
+        """Remove a memory from the active index via soft delete.
+
+        Wraps ``MemoryStore.supersede_memory`` with an empty ``new_id`` so
+        that ``is_active()`` treats the record as inactive while the hash
+        remains in Redis for audit purposes.
+
+        Args:
+            memory_id: UUID string of the memory to forget.
+
+        Returns:
+            True if the memory existed and was marked inactive; False if not
+            found or the memory system is unavailable.
+        """
+        if not self.available:
+            return False
+        record = self._store.get_memory(memory_id, bump_access=False)
+        if record is None:
+            return False
+        self._store.supersede_memory(memory_id, new_id="")
+        return True
+
+    def pin_memory(self, memory_id: str) -> bool:
+        """Set importance=5 on an existing memory and re-save it.
+
+        Re-saving calls ``MemoryStore.save_memory``, which re-indexes the
+        record and re-applies TTL.  For importance=5 the TTL map returns
+        ``None`` (no expiry), so the key persists indefinitely.
+
+        Args:
+            memory_id: UUID string of the memory to pin.
+
+        Returns:
+            True if the memory was found and pinned; False otherwise.
+        """
+        if not self.available:
+            return False
+        record = self._store.get_memory(memory_id, bump_access=False)
+        if record is None:
+            return False
+        record.importance = 5
+        self._store.save_memory(record)
+        return True
+
     def list_memories(self, limit: int = 50) -> list[MemoryRecord]:
         if not self.available:
             return []

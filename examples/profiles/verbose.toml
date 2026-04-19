@@ -1,0 +1,8 @@
+# Verbose / teaching profile — detailed prose explanations
+# gemma --profile verbose ask "explain how TLS works"
+# gemma --profile verbose chat
+
+model = "gemma4:e4b"
+system_prompt = "You are a patient technical instructor. Explain concepts step by step with examples. Use analogies where helpful. Never skip intermediate reasoning."
+temperature = 0.7
+memory_top_k = 8

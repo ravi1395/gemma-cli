@@ -44,6 +44,10 @@ def _k_memory_embed(mid: str) -> str:
 
 _K_MEMORY_INDEX = "gemma:memory:index"
 
+# Monotonic counter incremented on every save/supersede so MemoryRetriever
+# can detect stale in-memory embedding caches without a full fetch.
+_K_MEMORY_GENERATION = "gemma:memory:generation"
+
 
 def _k_session_turns(sid: str) -> str:
     return f"gemma:session:{sid}:turns"
@@ -118,6 +122,39 @@ class MemoryStore:
     # Memory CRUD
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Generation counter (task 5.2 — lazy embedding cache invalidation)
+    # ------------------------------------------------------------------
+
+    def _bump_generation(self) -> None:
+        """Atomically increment the global embedding-generation counter.
+
+        Called on every save_memory and supersede_memory so that
+        MemoryRetriever can detect stale in-memory embedding caches by
+        comparing its stored generation against this counter.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.incr(_K_MEMORY_GENERATION)
+        except Exception:
+            pass
+
+    def get_generation(self) -> Optional[int]:
+        """Return the current embedding-generation counter value.
+
+        Returns:
+            The counter as an int (0 if the key does not exist yet), or
+            None when Redis is unavailable.
+        """
+        if self._client is None:
+            return None
+        try:
+            val = self._client.get(_K_MEMORY_GENERATION)
+            return int(val) if val is not None else 0
+        except Exception:
+            return None
+
     def save_memory(self, record: MemoryRecord) -> None:
         """Persist a MemoryRecord: HSET fields, ZADD to index, apply TTL."""
         if self._client is None:
@@ -138,6 +175,8 @@ class MemoryStore:
             pipe.expire(key, ttl)
             pipe.expire(_k_memory_embed(record.memory_id), ttl)
         pipe.execute()
+        # Invalidate retriever caches that may hold stale embeddings.
+        self._bump_generation()
 
     def get_memory(
         self, memory_id: str, *, bump_access: bool = True
@@ -170,6 +209,8 @@ class MemoryStore:
         pipe.hset(_k_memory(old_id), "superseded_by", new_id)
         pipe.zrem(_K_MEMORY_INDEX, old_id)
         pipe.execute()
+        # Invalidate retriever caches; the index changed.
+        self._bump_generation()
 
     def get_all_active_memories(self) -> list[MemoryRecord]:
         """Return every MemoryRecord currently in the index. For reconsolidation."""

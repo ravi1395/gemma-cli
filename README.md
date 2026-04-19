@@ -32,6 +32,13 @@ A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backe
   - [chat](#chat)
   - [pipe](#pipe)
   - [history](#history)
+- [Profiles](#profiles)
+- [Scripting mode](#scripting-mode)
+- [Memory power-user commands](#memory-power-user-commands)
+  - [remember](#remember)
+  - [forget](#forget)
+  - [pin](#pin)
+  - [context](#context)
 - [Terminal-assistant commands](#terminal-assistant-commands)
   - [sh](#sh)
   - [explain](#explain)
@@ -525,6 +532,9 @@ gemma ask "What did we decide about the auth layer?" --keep-alive 2h
 | `--no-memory` | off | Skip memory retrieval and recording |
 | `--think` | off | Enable Gemma 4 extended thinking mode |
 | `--keep-alive` | `30m` | How long Ollama keeps the model in RAM after this call (`"2h"`, `"-1"` to pin, `"0"` to evict) |
+| `--json` | off | Emit a JSON object (`content`, `model`, `elapsed_ms`, `cache_hit`) |
+| `--only <field>` | — | Print a single JSON field naked (mutually exclusive with `--json`/`--code`) |
+| `--code` | off | Extract and emit only fenced code blocks (mutually exclusive with `--json`/`--only`) |
 
 ---
 
@@ -594,6 +604,9 @@ cat report.md | gemma pipe "Extract action items" --no-stream
 |---|---|---|
 | `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
 | `--no-stream` | off | Collect and render as Markdown instead of streaming |
+| `--json` | off | Emit a JSON object (`content`, `model`, `elapsed_ms`, `cache_hit`) |
+| `--only <field>` | — | Print a single JSON field naked (mutually exclusive with `--json`/`--code`) |
+| `--code` | off | Extract and emit only fenced code blocks (mutually exclusive with `--json`/`--only`) |
 
 ---
 
@@ -657,6 +670,226 @@ by importance:
   3: 4
   2: 1
 ```
+
+---
+
+## Profiles
+
+Named profiles let you define reusable combinations of model, system prompt, temperature, and other config fields so you can switch between them without repeating CLI flags.
+
+### Profile files
+
+Profiles live at `~/.config/gemma/profiles/<name>.toml`. Each file is a flat TOML mapping whose keys match fields in the `Config` dataclass. Any field you omit falls back to the dataclass default.
+
+```toml
+# ~/.config/gemma/profiles/code.toml
+model = "gemma4:12b"
+system_prompt = "You are a senior code reviewer. Output only code unless explicitly asked for prose."
+temperature = 0.2
+memory_top_k = 3
+```
+
+### Activating a profile
+
+Pass `--profile <name>` (or `-p <name>`) before any subcommand:
+
+```bash
+gemma --profile code ask "refactor this function"
+gemma --profile verbose chat
+gemma --profile fast pipe "summarize this"
+```
+
+### Resolution order
+
+When a profile and a CLI flag both set the same field, the CLI flag wins:
+
+| Priority | Source |
+|---|---|
+| 1 (highest) | Explicit CLI flag (e.g. `--model gemma4:27b`) |
+| 2 | Profile TOML field |
+| 3 (lowest) | `Config` dataclass default |
+
+```bash
+# Profile sets model=gemma4:12b but --model overrides it to gemma4:27b
+gemma --profile code ask "review this" --model gemma4:27b
+```
+
+### Example profiles
+
+Three starter profiles are included in [`examples/profiles/`](examples/profiles/):
+
+| File | Purpose |
+|---|---|
+| `code.toml` | Code review: `gemma4:12b`, low temperature, concise output |
+| `verbose.toml` | Teaching mode: detailed step-by-step explanations |
+| `fast.toml` | Quick lookups: smallest model, pinned in RAM, minimal memory overhead |
+
+Copy them to `~/.config/gemma/profiles/` to use:
+
+```bash
+mkdir -p ~/.config/gemma/profiles
+cp examples/profiles/*.toml ~/.config/gemma/profiles/
+```
+
+Unknown TOML keys emit a `UserWarning` and are ignored — forward-compatible with future Config fields.
+
+---
+
+## Scripting mode
+
+Three mutually exclusive output flags adapt `ask` and `pipe` for scripting workflows. They are opt-in — omitting all three gives the default Rich Markdown output.
+
+### `--json`
+
+Emit the full response as a single JSON object. Ideal for piping to `jq`.
+
+```bash
+gemma ask --json "list three sorting algorithms" | jq '.content'
+gemma ask --json "what model are you?" | jq '{model, elapsed_ms}'
+```
+
+Output shape:
+
+```json
+{"content": "...", "model": "gemma4:e4b", "elapsed_ms": 1842, "cache_hit": false}
+```
+
+### `--only <field>`
+
+Print the value of a single field, naked (no JSON wrapper). Valid fields: `content`, `model`, `elapsed_ms`, `cache_hit`.
+
+```bash
+# Capture just the response text
+reply=$(gemma ask --only content "write a one-liner to list Python files")
+
+# Measure latency
+gemma ask --only elapsed_ms "ping"
+```
+
+### `--code`
+
+Strip prose and emit only the fenced code blocks from the response. Use this to pipe generated code directly to a shell or file.
+
+```bash
+# Generate and run a bash one-liner
+gemma ask --code "write a bash command to find the 10 largest files" | sh
+
+# Save generated Python to a file
+gemma ask --code "write a Python hello world script" > hello.py
+
+# Works with pipe too
+echo "sort a list in Python" | gemma pipe --code > sort.py
+```
+
+If the response contains no fenced blocks the full content is emitted as a fallback.
+
+### Mutual exclusivity
+
+`--json`, `--only`, and `--code` are mutually exclusive — passing more than one exits with an error.
+
+```bash
+gemma ask --json --code "…"
+# error: --json, --only, and --code are mutually exclusive
+```
+
+---
+
+## Memory power-user commands
+
+These commands let you manipulate the memory store directly, without going through the conversation pipeline.
+
+---
+
+### remember
+
+Seed a fact directly into the memory store.  The content is embedded with `nomic-embed-text` and saved as a `MemoryRecord` immediately — no conversation or condensation step required.  The assigned `memory_id` is printed to stdout.
+
+```bash
+# Store a plain fact (category: factual_context, importance: 4)
+gemma remember "I prefer type annotations in all Python code."
+
+# Store a task-state fact
+gemma remember "Auth rewrite is in progress — using JWT, deadline end of month." --category task
+
+# Store a critical instruction that should never expire
+gemma remember "Never use rm -rf without explicit confirmation." --category instruction --importance 5
+
+# Store a user preference
+gemma remember "Preferred language: Python. Avoid shell scripts where possible." --category pref
+
+# Store a correction at maximum importance
+gemma remember "The staging Redis URL is redis://staging.internal:6379/1, not /0." --importance 5
+```
+
+The printed `memory_id` can be used with `pin` and `forget` to manage the memory later.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--category`, `-c` | `feat` | Category shortcut: `feat` (factual_context), `pref` (user_preference), `task` (task_state), `instruction`, `correction`, `relationship`, `tool_usage`. Full enum values also accepted. |
+| `--importance`, `-i` | `4` | Importance tier 1 (trivial, 6-hour TTL) to 5 (critical, no expiry). |
+
+---
+
+### forget
+
+Remove a memory from the active index.  The record is **soft-deleted**: the Redis hash is kept for audit purposes but the `superseded_by` field is set so the record is never retrieved or injected into future prompts.
+
+Exactly one of the three target selectors must be provided.
+
+```bash
+# Forget by explicit ID (as printed by gemma remember)
+gemma forget abc123-...
+
+# Forget the most recently created memory (with confirmation)
+gemma forget --last
+
+# Forget the top-1 memory matching a query
+gemma forget --match "staging Redis URL"
+
+# Skip the confirmation prompt
+gemma forget --last --force
+gemma forget --match "old auth token" --force
+```
+
+Without `--force` the command prints the memory content and asks `Forget this? [y/N]` before proceeding.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--last` | off | Target the most recently created active memory |
+| `--match QUERY` | — | Target the top-1 memory with the highest cosine similarity to QUERY |
+| `--force`, `-f` | off | Skip the confirmation prompt |
+
+---
+
+### pin
+
+Set `importance=5` on an existing memory so it never expires.  The record is re-saved with the new importance, which maps to `None` (no TTL) in the tier table and causes the key to persist indefinitely.
+
+```bash
+# Pin by explicit ID
+gemma pin abc123-...
+
+# Pin the top-1 memory matching a query
+gemma pin --match "JWT deadline"
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--match QUERY` | — | Target the top-1 memory with the highest cosine similarity to QUERY |
+
+---
+
+### context
+
+Preview what memory context would be injected for a given query, without calling the model.  Useful for debugging why the model gave an unexpected answer or to verify that a recently seeded fact is retrievable.
+
+```bash
+gemma context "auth rewrite JWT"
+gemma context "what did we decide about Redis?"
+gemma context "preferred Python style"
+```
+
+Output is a Rich table with columns **Imp** (importance), **Category**, **Similarity** (cosine score), and **Content**, followed by the most recent turns in the current session's sliding window.
 
 ---
 
@@ -874,7 +1107,7 @@ any modification.
 
 ## Configuration reference
 
-All settings live in `gemma/config.py` as a plain dataclass. CLI flags override individual values at runtime; there is no config file — edit the dataclass defaults or subclass `Config` to change persistent behaviour.
+All settings live in `gemma/config.py` as a plain dataclass. CLI flags override individual values at runtime. Named TOML profiles (see [Profiles](#profiles)) can set any field persistently without editing code.
 
 | Field | Default | Description |
 |---|---|---|
@@ -887,6 +1120,9 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 | `memory_enabled` | `True` | Master switch; set `False` to disable all Redis/embedding features |
 | `thinking_mode` | `False` | Enable Gemma 4 extended thinking; the model reasons step-by-step before responding |
 | `ollama_keep_alive` | `"30m"` | How long Ollama keeps the model loaded in RAM between calls. Accepts duration strings (`"30m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
+| `cache_enabled` | `True` | Master switch for the SHA-keyed response cache |
+| `cache_ttl_seconds` | `3600` | Cache entry TTL in seconds; `0` disables all caching |
+| `cache_temperature_max` | `0.3` | Skip caching for calls with temperature above this value |
 | `redis_url` | `redis://localhost:6379/0` | Redis connection string |
 | `embedding_model` | `nomic-embed-text` | Ollama model used for 768-dim embeddings |
 | `sliding_window_size` | `8` | Number of raw turns kept in the Redis list |
@@ -899,11 +1135,79 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 
 ---
 
+## Response cache
+
+gemma-cli caches full LLM responses in Redis for deterministic, low-temperature calls. Repeated invocations with the same inputs (e.g. `gemma commit` on the same staged diff) skip the Ollama round-trip entirely and return in under 20 ms.
+
+### How it works
+
+The cache key is a SHA256 hash of the call inputs:
+
+```text
+sha256(model + "\0" + temperature + "\0" + system_prompt + "\0" + user_prompt + "\0" + keep_alive)
+```
+
+On a cache miss the response is stored in Redis as:
+
+```text
+gemma:cache:<sha256-hex>  →  {"content": "...", "created_at": <unix_ts>}
+```
+
+Entries expire after `cache_ttl_seconds` (default 1 hour). Setting `cache_ttl_seconds = 0` disables caching entirely.
+
+### Which commands are cached
+
+| Command | Default temperature | Cached by default? |
+|---|---|---|
+| `commit` | 0.2 | Yes |
+| `sh` | 0.2 | Yes |
+| `diff` | 0.3 | Yes |
+| `ask --no-stream` | 0.7 | No (above threshold) |
+| `pipe --no-stream` | 0.7 | No (above threshold) |
+| `explain --no-stream` | 0.7 | No (above threshold) |
+
+Streaming calls (`ask`, `pipe`, `explain` without `--no-stream`) are **never** cached — they are interactive and higher-temperature. To enable caching for `ask`/`pipe`/`explain`, lower the temperature via a profile (e.g. `temperature = 0.2`) and pass `--no-stream`.
+
+### Bypass flags
+
+All cached commands accept two flags:
+
+| Flag | Effect |
+|---|---|
+| `--no-cache` | Bypass the cache entirely; always call the model and skip storing the result |
+| `--cache-only` | Error out if there is no cache hit; never call the model (useful for asserting cached state in scripts) |
+
+```bash
+# Force a fresh Ollama call, ignore any cached result
+gemma commit --no-cache
+
+# Assert the response is already cached (exit 1 if not)
+gemma commit --cache-only
+
+# Bypass caching for a single diff summary
+gemma diff --no-cache HEAD~1
+```
+
+### Disabling the cache
+
+Set `cache_enabled = false` in a TOML profile, or set `cache_ttl_seconds = 0`:
+
+```toml
+# ~/.config/gemma/profiles/nocache.toml
+cache_enabled = false
+```
+
+```bash
+gemma --profile nocache commit
+```
+
+---
+
 ## Secret redaction
 
 Developers routinely paste configuration snippets, stack traces, and log files into the CLI.  Any of those inputs might contain credentials.  Once a turn is condensed into a Redis `MemoryRecord` it can persist for days — so gemma-cli scrubs secrets out of every turn **before** it reaches the store.
 
-### How it works
+### Redaction mechanism
 
 Redaction runs automatically inside `MemoryManager.record_turn()` on every `ask` and `chat` turn, both the user message and the model reply.  It is transparent: the conversation continues normally, and the model still sees that a value was present (the redaction marker preserves context), just not what the value was.
 

@@ -1,0 +1,8 @@
+# Code-review profile
+# gemma --profile code ask "refactor this function"
+# gemma --profile code chat
+
+model = "gemma4:12b"
+system_prompt = "You are a senior code reviewer. Output only code unless explicitly asked for prose. Prefer concise, idiomatic solutions."
+temperature = 0.2
+memory_top_k = 3

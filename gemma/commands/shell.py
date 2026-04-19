@@ -32,7 +32,9 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from gemma.cache import build_cache
 from gemma.client import chat as client_chat
+from gemma.commands.clipboard import handle_copy_flags
 from gemma.config import Config
 
 
@@ -129,6 +131,23 @@ def sh_command(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h').",
     ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the response cache."),
+    cache_only: bool = typer.Option(
+        False, "--cache-only",
+        help="Error if no cache hit (useful for verifying cached state).",
+    ),
+    copy: bool = typer.Option(
+        False, "--copy",
+        help="Copy the generated command to the system clipboard.",
+    ),
+    copy_tee: bool = typer.Option(
+        False, "--copy-tee",
+        help="Print the command AND copy it to the clipboard.",
+    ),
+    allow_secrets: bool = typer.Option(
+        False, "--allow-secrets",
+        help="Allow clipboard copy even if secrets are detected in the output.",
+    ),
 ) -> None:
     """Translate a natural-language description into a shell command."""
     cfg = Config()
@@ -153,16 +172,33 @@ def sh_command(
         {"role": "user", "content": user_msg},
     ]
 
-    # Collect the full response (non-streaming; we need it before acting)
-    raw_parts: list[str] = []
-    try:
-        for _chunk_type, text in client_chat(messages, cfg, stream=False):
-            raw_parts.append(text)
-    except Exception as exc:
-        err_console.print(f"[red]gemma sh: model error — {exc}[/red]")
-        raise typer.Exit(code=1)
+    # Cache path: sh runs at temperature 0.2, well within threshold.
+    cache = (
+        build_cache(cfg)
+        if (not no_cache and cfg.cache_enabled and cfg.temperature <= cfg.cache_temperature_max)
+        else None
+    )
+    raw: Optional[str] = cache.get(messages, cfg) if cache else None
 
-    raw = "".join(raw_parts)
+    if raw is None:
+        if cache_only:
+            err_console.print(
+                "[red]gemma sh: no cache hit and --cache-only was set.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        # Collect the full response (non-streaming; we need it before acting)
+        raw_parts: list[str] = []
+        try:
+            for _chunk_type, text in client_chat(messages, cfg, stream=False):
+                raw_parts.append(text)
+        except Exception as exc:
+            err_console.print(f"[red]gemma sh: model error — {exc}[/red]")
+            raise typer.Exit(code=1)
+
+        raw = "".join(raw_parts)
+        if cache and raw:
+            cache.put(messages, cfg, raw)
     cmd = _clean_model_command(raw)
 
     if not cmd:
@@ -184,12 +220,29 @@ def sh_command(
     if not sys.stdout.isatty() or no_exec:
         # If --explain was requested, include the comment line too
         print(cmd)
+        # Clipboard integration: copy the bare command, not the possibly
+        # commented-out --explain prefix, so paste-into-terminal "just
+        # works".
+        handle_copy_flags(
+            exec_line,
+            copy=copy, copy_tee=copy_tee,
+            allow_secrets=allow_secrets, tool_name="sh",
+        )
         return
 
     # ------------------------------------------------------------------
     # Interactive mode: show a panel, then optionally run.
     # ------------------------------------------------------------------
     console.print(Panel(cmd, title="[bold cyan]gemma sh[/bold cyan]", border_style="cyan"))
+
+    # Interactive clipboard copy happens before the run-prompt so the
+    # command is already on the clipboard even if the user declines to
+    # execute it (the common "copy, edit slightly, paste" flow).
+    handle_copy_flags(
+        exec_line,
+        copy=copy, copy_tee=copy_tee,
+        allow_secrets=allow_secrets, tool_name="sh",
+    )
 
     # Safety check — warn and refuse to exec dangerous patterns.
     if _is_dangerous(exec_line):
