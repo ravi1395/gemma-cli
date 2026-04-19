@@ -31,6 +31,7 @@ from typing import Any, List, Optional
 
 import numpy as np
 
+from gemma.rag._math import normalise
 from gemma.rag.store import RedisVectorStore, StoredChunk
 
 
@@ -65,6 +66,19 @@ class RetrievalHit:
     def citation(self) -> str:
         """Short citation footer — ``gemma/rag/store.py:42-97``."""
         return f"{self.path}:{self.line_range}"
+
+    def as_dict(self) -> dict:
+        """Return a JSON-serialisable dict for tool-result payloads."""
+        return {
+            "chunk_id": self.chunk_id,
+            "path": self.path,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "text": self.text,
+            "header": self.header,
+            "score": float(self.score),
+            "citation": self.citation,
+        }
 
 
 class RAGRetriever:
@@ -112,19 +126,15 @@ class RAGRetriever:
 
         pool = fetch_k if fetch_k is not None else max(k, k * _FETCH_MULTIPLIER)
 
-        # Phase 1: plain top-pool by cosine. The store normalises the
-        # query vector itself, so we can hand it through raw.
-        candidates = self._store.search(query_vec, k=pool)
-        if not candidates:
+        # Phase 1+2: one MGET for the top-pool cosine AND the MMR pairwise
+        # map. Previously this path fired two full ``load_all_embeddings``
+        # calls (~60 MB on the wire at 10k chunks × 768-dim); now it fires
+        # one (#1). The store also pipelines the per-winner HGETALLs.
+        candidates, embed_map = self._store.search_with_embeddings(query_vec, k=pool)
+        if not candidates or not embed_map:
             return []
 
-        # Phase 2: MMR on the candidates. We need each candidate's
-        # *embedding* for the pairwise similarities; fetch them in bulk.
-        embed_map = self._store.load_all_embeddings()
-        if not embed_map:
-            return []
-
-        qvec = _normalise(np.asarray(query_vec, dtype=np.float32))
+        qvec = normalise(np.asarray(query_vec, dtype=np.float32))
         selected = _mmr(
             candidates=candidates,
             embed_map=embed_map,
@@ -164,47 +174,54 @@ def _mmr(
     Assumes stored vectors are L2-normalised (the indexer guarantees
     this), so dot-product = cosine. Also assumes ``query_vec`` is
     already normalised.
+
+    Vectorised implementation (#5): the candidate pool is pre-stacked
+    into a single ``(pool, D)`` matrix and ``max_sim_so_far`` is updated
+    each iteration with ``np.maximum(max_sim_so_far, pool @ pool[pick])``
+    — one BLAS dot instead of ``pool`` Python-level dot products per
+    pick. Tie-breaking is preserved: ``np.argmax`` returns the first
+    maximum, matching the old ``>`` loop semantics.
     """
     if k <= 0 or not candidates:
         return []
 
     # Filter candidates that don't have an embedding available.
-    usable = [(c, embed_map[c.id]) for c in candidates if c.id in embed_map]
+    usable: List[StoredChunk] = [c for c in candidates if c.id in embed_map]
     if not usable:
         # Fall through to plain order; better than returning empty.
         return candidates[:k]
 
-    remaining = list(usable)
+    pool = np.stack([embed_map[c.id] for c in usable], axis=0).astype(np.float32)
+    relevance = pool @ query_vec.astype(np.float32)
+    n = pool.shape[0]
+    # Sentinel distinguishes "no selection yet" (max-sim is 0 in the
+    # legacy loop) from "negative similarity to a selected item" (the
+    # legacy loop keeps negatives, does not clip at zero).
+    max_sim: Optional[np.ndarray] = None
+    taken = np.zeros(n, dtype=bool)
+
     selected: List[StoredChunk] = []
-
-    # Pre-compute relevance (cosine to query) once.
-    relevance = {c.id: float(v @ query_vec) for c, v in usable}
-
-    while remaining and len(selected) < k:
-        best_score = -float("inf")
-        best_idx = 0
-        for i, (cand, cand_vec) in enumerate(remaining):
-            rel = relevance[cand.id]
-            # Similarity to the most-similar already-selected item.
-            if selected:
-                sims = [float(cand_vec @ embed_map[s.id]) for s in selected if s.id in embed_map]
-                max_sim = max(sims) if sims else 0.0
-            else:
-                max_sim = 0.0
-            mmr_score = lam * rel - (1.0 - lam) * max_sim
-            if mmr_score > best_score:
-                best_score = mmr_score
-                best_idx = i
-        chosen, _cv = remaining.pop(best_idx)
-        # Attach the MMR-adjusted score so callers see the trade-off.
-        chosen.score = best_score
+    target = min(k, n)
+    while len(selected) < target:
+        if max_sim is None:
+            mmr = lam * relevance
+        else:
+            mmr = lam * relevance - (1.0 - lam) * max_sim
+        mmr[taken] = -np.inf
+        pick = int(np.argmax(mmr))
+        chosen = usable[pick]
+        chosen.score = float(mmr[pick])
         selected.append(chosen)
+        taken[pick] = True
+        # Update max-similarity-to-selected in one BLAS call. First
+        # assignment seeds the vector with the first pick's sims so
+        # negative similarities are preserved (matches legacy ``max()``).
+        sims = pool @ pool[pick]
+        if max_sim is None:
+            max_sim = sims
+        else:
+            np.maximum(max_sim, sims, out=max_sim)
 
     return selected
 
 
-def _normalise(vec: np.ndarray) -> np.ndarray:
-    norm = float(np.linalg.norm(vec))
-    if norm == 0.0:
-        return vec
-    return vec / norm

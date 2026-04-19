@@ -81,6 +81,50 @@ class FileEntry:
             chunk_ids=list(chunk_ids or []),
         )
 
+    @classmethod
+    def probe_from_disk(
+        cls,
+        root: Path,
+        path: Path,
+        *,
+        prior: Optional["FileEntry"] = None,
+        chunk_ids: Optional[List[str]] = None,
+    ) -> "FileEntry":
+        """Git-style stat-cache fast path: reuse ``prior`` sha1 when mtime+size match.
+
+        If ``prior`` is supplied and its ``(mtime_ns, size)`` pair matches
+        the on-disk stat, we skip re-hashing and inherit the prior sha1.
+        Only when something actually changed do we read the full file and
+        compute a fresh hash.
+
+        Args:
+            root:      Workspace root (used to derive the relative path).
+            path:      Absolute or root-relative path to the file.
+            prior:     Previously indexed FileEntry for this path, or None.
+            chunk_ids: Optional chunk IDs to attach (populated by the indexer).
+
+        Returns:
+            A FileEntry with mtime_ns, size, and sha1 populated.
+        """
+        abs_path = (root / path).resolve() if not path.is_absolute() else path
+        rel = abs_path.relative_to(root.resolve()).as_posix()
+        st = abs_path.stat()
+        mtime_ns = st.st_mtime_ns
+        size = st.st_size
+
+        if prior is not None and prior.mtime_ns == mtime_ns and prior.size == size:
+            sha1 = prior.sha1
+        else:
+            sha1 = _sha1_of_file(abs_path)
+
+        return cls(
+            path=rel,
+            mtime_ns=mtime_ns,
+            size=size,
+            sha1=sha1,
+            chunk_ids=list(chunk_ids or []),
+        )
+
     def to_json(self) -> str:
         """Serialise the entry as a compact JSON string for Redis storage."""
         return json.dumps(asdict(self), separators=(",", ":"))

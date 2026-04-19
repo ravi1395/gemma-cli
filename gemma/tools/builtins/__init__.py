@@ -21,3 +21,4 @@ from gemma.tools.builtins import fs_archive  # noqa: F401
 from gemma.tools.builtins import lint       # noqa: F401
 from gemma.tools.builtins import tests      # noqa: F401
 from gemma.tools.builtins import net_fetch  # noqa: F401
+from gemma.tools.builtins import rag_query  # noqa: F401

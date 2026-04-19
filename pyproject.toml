@@ -19,9 +19,15 @@ memory = [
     "redis>=5.0",
     "numpy>=1.24",
 ]
+agent = [
+    "trafilatura>=1.10",
+]
 dev = [
     "pytest>=8.0",
     "fakeredis>=2.20",
+]
+bench = [
+    "pytest-benchmark>=4.0",
 ]
 
 [project.scripts]
@@ -30,3 +36,10 @@ gemma = "gemma.main:app"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gemma*"]
+
+# Benchmarks live under tests/bench/ but are excluded from the default
+# test run. They require pytest-benchmark (optional "bench" extra) and
+# produce wall-clock numbers that would be noisy in CI. Run them
+# explicitly: ``pytest tests/bench``. See docs/perf/benchmarks.md.
+[tool.pytest.ini_options]
+addopts = "--ignore=tests/bench"

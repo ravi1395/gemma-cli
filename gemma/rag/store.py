@@ -38,7 +38,7 @@ per-file set avoids scanning the whole index on every delete.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -84,6 +84,22 @@ def _k_file_chunks(ns: str, path: str) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class StoreSnapshot:
+    """Lightweight read-only view of a namespace captured in one pipeline.
+
+    Replaces three sequential Redis round-trips in ``status_command`` with
+    a single pipelined call (#11).
+    """
+
+    #: Embedding-model fingerprint set by the indexer (model, dim, last_indexed_at).
+    meta: Dict[str, str] = field(default_factory=dict)
+    #: Number of files currently recorded in the manifest.
+    manifest_size: int = 0
+    #: Total number of active chunks in the index SET.
+    chunk_count: int = 0
+
+
+@dataclass
 class StoredChunk:
     """A chunk as it comes back from the store.
 
@@ -124,6 +140,7 @@ class RedisVectorStore:
         redis_url: str = "redis://localhost:6379/0",
         *,
         client: Optional[Any] = None,
+        pool: Optional[Any] = None,
     ):
         """Wire up the store.
 
@@ -132,6 +149,10 @@ class RedisVectorStore:
             redis_url: Used to build a real client when ``client`` is None.
             client:    Pre-built Redis client. Tests inject ``fakeredis``
                        here; production code lets us build our own.
+            pool:      Optional shared :class:`redis.ConnectionPool` (#3).
+                       When supplied, text + binary clients are built
+                       from it so the store doesn't open its own TCP
+                       connections.
 
         Note: Redis clients must be constructed with
         ``decode_responses=True`` so ``hgetall`` returns ``str``
@@ -140,6 +161,7 @@ class RedisVectorStore:
         """
         self._namespace = namespace
         self._redis_url = redis_url
+        self._pool = pool
         self._client = client
         self._binary_client: Optional[Any] = None
 
@@ -158,7 +180,10 @@ class RedisVectorStore:
                 raise RuntimeError(
                     "redis-py not installed. RAG requires the 'memory' extra."
                 )
-            self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+            if self._pool is not None:
+                self._client = redis.Redis(connection_pool=self._pool, decode_responses=True)
+            else:
+                self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
         return self._client
 
     def _binary_conn(self) -> Any:
@@ -306,6 +331,30 @@ class RedisVectorStore:
         c = self._conn()
         return dict(c.hgetall(_k_meta(self._namespace)))
 
+    def snapshot(self) -> "StoreSnapshot":
+        """Fetch meta, manifest size, and chunk count in one Redis pipeline.
+
+        Replaces three sequential round-trips (``get_meta``,
+        ``load_manifest_hash`` + ``len``, ``chunk_count``) with a single
+        pipelined batch so ``status_command`` pays one network RTT instead
+        of three (#11).
+
+        Returns:
+            A :class:`StoreSnapshot` populated from the current namespace.
+        """
+        c = self._conn()
+        pipe = c.pipeline()
+        pipe.hgetall(_k_meta(self._namespace))
+        # HLEN is cheaper than HGETALL when we only need the count.
+        pipe.hlen(_k_manifest(self._namespace))
+        pipe.scard(_k_index(self._namespace))
+        meta_raw, manifest_size, chunk_count = pipe.execute()
+        return StoreSnapshot(
+            meta=dict(meta_raw) if meta_raw else {},
+            manifest_size=int(manifest_size),
+            chunk_count=int(chunk_count),
+        )
+
     # ------------------------------------------------------------------
     # Read helpers
     # ------------------------------------------------------------------
@@ -332,6 +381,35 @@ class RedisVectorStore:
             text=row.get("text", ""),
             header=row.get("header") or None,
         )
+
+    def get_chunks(self, chunk_ids: List[str]) -> List[Optional[StoredChunk]]:
+        """Pipelined fetch of many chunks in a single round-trip.
+
+        Replaces the per-winner ``get_chunk`` loop in :meth:`search` with
+        one batched HGETALL pipeline (#1). Returns a list the same length
+        as ``chunk_ids``; entries where the chunk was absent are ``None``.
+        """
+        if not chunk_ids:
+            return []
+        c = self._conn()
+        pipe = c.pipeline()
+        for cid in chunk_ids:
+            pipe.hgetall(_k_chunk(self._namespace, cid))
+        rows = pipe.execute()
+        out: List[Optional[StoredChunk]] = []
+        for cid, row in zip(chunk_ids, rows):
+            if not row:
+                out.append(None)
+                continue
+            out.append(StoredChunk(
+                id=cid,
+                path=row.get("path", ""),
+                start_line=int(row.get("start_line", 0) or 0),
+                end_line=int(row.get("end_line", 0) or 0),
+                text=row.get("text", ""),
+                header=row.get("header") or None,
+            ))
+        return out
 
     def get_embedding(self, chunk_id: str) -> Optional[np.ndarray]:
         """Fetch one embedding. Returns None if the chunk is absent."""
@@ -377,18 +455,39 @@ class RedisVectorStore:
         of two L2-normalised vectors is just their dot product — fast
         and branch-free.
         """
+        hits, _embed_map = self.search_with_embeddings(query, k=k)
+        return hits
+
+    def search_with_embeddings(
+        self, query: np.ndarray, k: int = 5,
+    ) -> Tuple[List[StoredChunk], Dict[str, np.ndarray]]:
+        """Top-``k`` search that also returns the full pool embedding map (#1).
+
+        Folds what used to be two MGETs per query (one here, one in
+        :meth:`RAGRetriever.query` for the MMR re-rank) into a single
+        bulk fetch. Callers that don't need the matrix can keep using
+        :meth:`search`.
+
+        The winner metadata is fetched via a single pipelined HGETALL
+        batch (:meth:`get_chunks`) rather than per-winner round-trips.
+
+        Returns:
+            ``(hits, embed_map)``. ``embed_map`` maps every chunk id in
+            the namespace to its L2-normalised embedding so the caller
+            can compute pairwise similarities without a second MGET.
+        """
         if query.size == 0:
-            return []
+            return [], {}
 
         q = query.astype(np.float32)
         qnorm = float(np.linalg.norm(q))
         if qnorm == 0.0:
-            return []
+            return [], {}
         q = q / qnorm
 
         embeds = self.load_all_embeddings()
         if not embeds:
-            return []
+            return [], {}
 
         cids = list(embeds.keys())
         matrix = np.stack([embeds[c] for c in cids], axis=0)  # (N, D)
@@ -402,15 +501,18 @@ class RedisVectorStore:
             top_idx = np.argpartition(-scores, k)[:k]
             top_idx = top_idx[np.argsort(-scores[top_idx])]
 
+        ordered_cids = [cids[int(i)] for i in top_idx]
+        scored = {cids[int(i)]: float(scores[int(i)]) for i in top_idx}
+        # One pipelined HGETALL instead of k sequential round-trips.
+        fetched = self.get_chunks(ordered_cids)
+
         results: List[StoredChunk] = []
-        for i in top_idx:
-            cid = cids[int(i)]
-            sc = self.get_chunk(cid)
+        for cid, sc in zip(ordered_cids, fetched):
             if sc is None:
                 continue
-            sc.score = float(scores[int(i)])
+            sc.score = scored[cid]
             results.append(sc)
-        return results
+        return results, embeds
 
     # ------------------------------------------------------------------
     # Admin

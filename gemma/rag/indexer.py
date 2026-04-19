@@ -32,6 +32,7 @@ import numpy as np
 
 from gemma import safety as _safety
 from gemma.chunking import Chunk, chunk_for_path
+from gemma.rag._math import normalise
 from gemma.rag.manifest import FileEntry, Manifest, ManifestDiff
 from gemma.rag.store import RedisVectorStore
 
@@ -132,16 +133,30 @@ class RAGIndexer:
     # Public API
     # ------------------------------------------------------------------
 
-    def index(self, *, progress: Optional[Callable[[str], None]] = None) -> IndexStats:
+    def index(
+        self,
+        *,
+        progress: Optional[Callable[[str], None]] = None,
+        force_hash: bool = False,
+    ) -> IndexStats:
         """Walk the workspace, diff against the stored manifest, apply changes.
 
         ``progress`` is an optional callback invoked for high-level
         milestones ("walking", "embedding batch 2/5", "saving
         manifest") so the CLI can render a status line without this
         module depending on Rich.
+
+        ``force_hash`` bypasses the mtime+size fast path and always
+        recomputes sha1 — useful for paranoid callers or after a
+        filesystem clock reset.
         """
         stats = IndexStats()
         _p = progress or (lambda _msg: None)
+
+        # Load the prior manifest before walking so probe_from_disk can
+        # skip sha1 computation when mtime+size are unchanged (#2).
+        _p("loading prior manifest")
+        prior_manifest = Manifest.from_redis_hash(self._store.load_manifest_hash())
 
         # --- 1. Walk ---
         _p("walking workspace")
@@ -149,7 +164,9 @@ class RAGIndexer:
         for abs_path in self._walk():
             stats.files_scanned += 1
             try:
-                entry = FileEntry.from_disk(self._root, abs_path)
+                rel = abs_path.relative_to(self._root).as_posix()
+                prior_entry = None if force_hash else prior_manifest.get(rel)
+                entry = FileEntry.probe_from_disk(self._root, abs_path, prior=prior_entry)
             except OSError as exc:
                 stats.errors.append(f"stat failed: {abs_path}: {exc}")
                 stats.files_skipped += 1
@@ -160,7 +177,6 @@ class RAGIndexer:
 
         # --- 2. Diff ---
         _p("diffing against stored manifest")
-        prior_manifest = Manifest.from_redis_hash(self._store.load_manifest_hash())
         diff = prior_manifest.diff(new_manifest)
         stats.files_added = len(diff.added)
         stats.files_changed = len(diff.changed)
@@ -313,7 +329,7 @@ class RAGIndexer:
                 if vec is None or vec.size == 0:
                     stats.errors.append(f"empty embedding for {entry.path}:{chunk.id}")
                     continue
-                normalised = _normalise(vec)
+                normalised = normalise(vec)
                 try:
                     self._store.upsert_chunk(
                         chunk_id=chunk.id,
@@ -381,15 +397,6 @@ def _embed_input(entry: FileEntry, chunk: Chunk) -> str:
     if header:
         return f"[{entry.path} :: {header}]\n{chunk.text}"
     return f"[{entry.path}]\n{chunk.text}"
-
-
-def _normalise(vec: np.ndarray) -> np.ndarray:
-    """Return ``vec`` L2-normalised as float32. Zero-vec passes through."""
-    v = vec.astype(np.float32)
-    norm = float(np.linalg.norm(v))
-    if norm == 0.0:
-        return v
-    return v / norm
 
 
 def _probe_embedding_dim(embedder: Any) -> int:

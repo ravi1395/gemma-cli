@@ -95,6 +95,7 @@ class AuditRecord:
     duration_ms: int = 0
     approved_by: str = "auto"  # "auto" | "user" | "flag" | "refused"
     refusal_reason: Optional[str] = None
+    cached: bool = False      # True when the result was served from AgentSessionCache
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,7 @@ def make_record(
     duration_ms: int = 0,
     approved_by: str = "auto",
     refusal_reason: Optional[str] = None,
+    cached: bool = False,
 ) -> AuditRecord:
     """Build an :class:`AuditRecord`, redacting string-valued args.
 
@@ -186,6 +188,7 @@ def make_record(
         duration_ms=duration_ms,
         approved_by=approved_by,
         refusal_reason=refusal_reason,
+        cached=cached,
     )
 
 

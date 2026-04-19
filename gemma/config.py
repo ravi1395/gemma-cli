@@ -53,6 +53,10 @@ class Config:
     cache_ttl_seconds: int = 3600          # 0 = disable caching
     cache_temperature_max: float = 0.3     # skip caching above this temperature
 
+    # --- Agent loop ---
+    agent_max_turns: int = 8          # upper bound on tool-call turns per ask
+    agent_tool_cache: bool = True     # enable per-session READ-tool memoization
+
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
