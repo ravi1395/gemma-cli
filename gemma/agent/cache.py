@@ -20,6 +20,7 @@ Safety constraints
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -40,6 +41,13 @@ class AgentSessionCache:
     def __init__(self) -> None:
         """Create an empty cache for one agent session."""
         self._store: Dict[Tuple[str, str], str] = {}
+        # Guards concurrent get/put from parallel tool dispatch (#20).
+        # The dict operations themselves are GIL-protected, but the
+        # ``check is_cacheable → put`` sequence issued by _agent_loop
+        # and the ``check get → dispatch → put`` sequence across
+        # workers are not atomic. The lock makes both idempotent under
+        # a concurrent fan-out turn.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -56,7 +64,8 @@ class AgentSessionCache:
             Previously cached ``ToolResult.content`` string, or ``None``
             if this ``(tool, args)`` combination has not been cached.
         """
-        return self._store.get(self._key(tool, args))
+        with self._lock:
+            return self._store.get(self._key(tool, args))
 
     def put(self, tool: str, args: Dict[str, Any], content: str) -> None:
         """Store ``content`` for future lookups with the same ``(tool, args)``.
@@ -66,7 +75,8 @@ class AgentSessionCache:
             args:    Argument dict used in the handler call.
             content: ``ToolResult.content`` string to cache.
         """
-        self._store[self._key(tool, args)] = content
+        with self._lock:
+            self._store[self._key(tool, args)] = content
 
     @staticmethod
     def is_cacheable(capability: str) -> bool:

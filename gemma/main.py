@@ -276,6 +276,104 @@ def _extract_tool_call(call: Any) -> tuple[str, Dict[str, Any]]:
     return str(name), (args if isinstance(args, dict) else {})
 
 
+def _dispatch_one(
+    call: Any,
+    *,
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+) -> Optional[Dict[str, Any]]:
+    """Execute exactly one tool call and return a ``role=tool`` message.
+
+    This is the per-call unit that both the serial path and the
+    parallel-fan-out path (#20) share. Extracting it keeps both paths
+    identical in behaviour — they differ only in whether the caller
+    iterates sequentially or via ``ThreadPoolExecutor.map``.
+
+    Thread-safety:
+        The function itself is stateless; the side-effects it triggers
+        (audit log append, session cache read/write, dispatcher
+        invocation) are each responsible for their own locking:
+
+        * ``gemma.tools.audit`` serialises writes via a module-level
+          :class:`threading.Lock`.
+        * :class:`AgentSessionCache` holds its own lock over the dict.
+        * :class:`Dispatcher` guards ``calls_made`` with a lock so
+          budget accounting stays correct under concurrent dispatch.
+
+    Args:
+        call:          Raw tool-call element from the model reply.
+        dispatch:      Callable ``(name, args) → ToolResult | str``. When
+                       ``None``, returns a stub "not dispatched" message.
+        session_cache: Optional :class:`AgentSessionCache` for READ-tool
+                       memoization.
+        session_id:    Threaded into audit records.
+
+    Returns:
+        A ``role=tool`` message dict ready to append to ``messages``,
+        or ``None`` when the call has no usable tool name (in which
+        case the caller skips it to preserve prompt shape).
+    """
+    from gemma.tools import audit as _audit
+
+    # Normalise to a plain dict so _extract_tool_call is consistent.
+    if not isinstance(call, dict):
+        call = getattr(call, "__dict__", {}) or {"name": str(call)}
+    tool_name, tool_args = _extract_tool_call(call)
+    if not tool_name:
+        return None  # caller filters None out before appending
+
+    # --- Session-cache fast path (READ-only tools) ---
+    if session_cache is not None:
+        cached_val = session_cache.get(tool_name, tool_args)
+        if cached_val is not None:
+            _audit.append(_audit.make_record(
+                tool=tool_name,
+                capability="read",
+                args=tool_args,
+                session_id=session_id,
+                exit_code=0,
+                duration_ms=0,
+                approved_by="auto",
+                cached=True,
+            ))
+            return {"role": "tool", "name": tool_name, "content": cached_val}
+
+    # --- Miss — run the real dispatch (or stub). ---
+    if dispatch is not None:
+        raw_result = dispatch(tool_name, tool_args)
+        # Real Dispatcher returns ToolResult; stubs return str.
+        tool_result_str = (
+            raw_result.content if hasattr(raw_result, "content")
+            else str(raw_result)
+        )
+    else:
+        tool_result_str = f"(agent: tool {tool_name!r} not dispatched)"
+
+    # Populate cache when this tool's capability is READ.
+    if session_cache is not None:
+        try:
+            from gemma.tools import registry as _reg
+            spec, _ = _reg.get(tool_name)
+            if session_cache.is_cacheable(spec.capability.value):
+                session_cache.put(tool_name, tool_args, tool_result_str)
+        except KeyError:
+            pass  # Unregistered tool (e.g. bench stub) — skip.
+
+    return {"role": "tool", "name": tool_name, "content": tool_result_str}
+
+
+def _clamped_concurrency(cfg: "Config") -> int:
+    """Return ``cfg.agent_tool_concurrency`` clamped to ``[1, 16]``.
+
+    Hard-capped defensively even though the default is 4 — a broken
+    profile TOML setting this to 1000 should not spawn a thousand
+    threads on a user's laptop.
+    """
+    raw = int(getattr(cfg, "agent_tool_concurrency", 1))
+    return max(1, min(raw, 16))
+
+
 def _agent_loop(
     client: Any,
     cfg: "Config",
@@ -293,10 +391,20 @@ def _agent_loop(
     ``role=tool`` results, and loops until the model replies without
     tool calls or ``budget`` turns are exhausted.
 
+    Parallel dispatch (#20):
+        When ``cfg.agent_tool_concurrency > 1`` and a single turn
+        emits more than one tool call, the calls fan out across a
+        :class:`ThreadPoolExecutor` scoped to that turn. Order is
+        preserved via ``executor.map`` so the ``role=tool`` messages
+        line up with the ``tool_call_id`` the model sees next turn.
+        Single-call turns and ``concurrency == 1`` skip the executor
+        to keep microsecond overhead identical to the pre-#20 path.
+
     Args:
         client:       Object with a ``.chat(model, messages, tools, ...)``
                       method (``ollama.Client`` or a test stub).
-        cfg:          Active Config — provides model, temperature, etc.
+        cfg:          Active Config — provides model, temperature, and
+                      ``agent_tool_concurrency`` for #20.
         messages:     Message list, modified in place as turns accumulate.
         tools:        Tool schemas in Ollama/OpenAI format.
         budget:       Maximum number of model-call turns.
@@ -311,7 +419,7 @@ def _agent_loop(
         ``budget_exhausted`` is True when all ``budget`` turns were
         consumed without a terminal reply.
     """
-    from gemma.tools import audit as _audit
+    concurrency = _clamped_concurrency(cfg)
 
     last_content = ""
 
@@ -346,61 +454,71 @@ def _agent_loop(
             "tool_calls": list(raw_calls),
         })
 
-        for call in raw_calls:
-            # Normalise to a plain dict so _extract_tool_call is consistent.
-            if not isinstance(call, dict):
-                call = getattr(call, "__dict__", {}) or {"name": str(call)}
-            tool_name, tool_args = _extract_tool_call(call)
-            if not tool_name:
-                continue
-
-            # --- Session-cache fast path (READ-only tools) ---
-            cache_hit = False
-            tool_result_str = ""
-
-            if session_cache is not None:
-                cached_val = session_cache.get(tool_name, tool_args)
-                if cached_val is not None:
-                    cache_hit = True
-                    tool_result_str = cached_val
-                    _audit.append(_audit.make_record(
-                        tool=tool_name,
-                        capability="read",
-                        args=tool_args,
-                        session_id=session_id,
-                        exit_code=0,
-                        duration_ms=0,
-                        approved_by="auto",
-                        cached=True,
-                    ))
-
-            if not cache_hit:
-                if dispatch is not None:
-                    raw_result = dispatch(tool_name, tool_args)
-                    # Real Dispatcher returns ToolResult; stubs return str.
-                    tool_result_str = (
-                        raw_result.content if hasattr(raw_result, "content")
-                        else str(raw_result)
-                    )
-                else:
-                    tool_result_str = f"(agent: tool {tool_name!r} not dispatched)"
-
-                # Populate cache when this tool's capability is READ.
-                if session_cache is not None:
-                    try:
-                        from gemma.tools import registry as _reg
-                        spec, _ = _reg.get(tool_name)
-                        if session_cache.is_cacheable(spec.capability.value):
-                            session_cache.put(tool_name, tool_args, tool_result_str)
-                    except KeyError:
-                        pass  # Unregistered tool (e.g. bench stub) — skip.
-
-            messages.append({"role": "tool", "name": tool_name, "content": tool_result_str})
+        # --- Fan-out within the turn (parallel when >1 call + concurrency>1) ---
+        per_call_messages = _dispatch_turn_calls(
+            raw_calls,
+            concurrency=concurrency,
+            dispatch=dispatch,
+            session_cache=session_cache,
+            session_id=session_id,
+        )
+        for tool_msg in per_call_messages:
+            if tool_msg is not None:
+                messages.append(tool_msg)
     else:
         # Exhausted all budget turns without a terminal reply.
         return last_content, True
 
     return last_content, False
+
+
+def _dispatch_turn_calls(
+    raw_calls: List[Any],
+    *,
+    concurrency: int,
+    dispatch: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    session_cache: Optional[Any] = None,
+    session_id: str = "agent",
+) -> List[Optional[Dict[str, Any]]]:
+    """Dispatch all tool calls from one model turn, preserving order.
+
+    Single-call turns and ``concurrency == 1`` take a direct list
+    comprehension — no executor overhead. Multi-call turns with
+    ``concurrency > 1`` fan out through a bounded
+    :class:`ThreadPoolExecutor`; ``executor.map`` guarantees the
+    returned order matches the input order.
+    """
+    # Fast path: avoid the executor entirely when it would add overhead
+    # without any possible benefit.
+    if concurrency <= 1 or len(raw_calls) <= 1:
+        return [
+            _dispatch_one(
+                call,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            )
+            for call in raw_calls
+        ]
+
+    # Parallel fan-out. ``max_workers`` is capped at len(raw_calls) so
+    # we don't spawn idle threads for small turns. ``thread_name_prefix``
+    # makes the threads identifiable in tracebacks and profilers.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(
+        max_workers=min(concurrency, len(raw_calls)),
+        thread_name_prefix="agent-tool",
+    ) as pool:
+        return list(pool.map(
+            lambda call: _dispatch_one(
+                call,
+                dispatch=dispatch,
+                session_cache=session_cache,
+                session_id=session_id,
+            ),
+            raw_calls,
+        ))
 
 
 # -----------------------------------------------------------------------------

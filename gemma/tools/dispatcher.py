@@ -19,6 +19,7 @@ high-level integration tests.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -61,6 +62,14 @@ class Dispatcher:
     # its own so two concurrent dispatchers don't clobber each other.
     calls_made: int = 0
 
+    # Guards the ``calls_made`` read-modify-write against concurrent
+    # dispatch (#20 ThreadPoolExecutor). Without this lock a fan-out
+    # of N calls against a budget of M can let more than M through
+    # under high concurrency. Cheap: only held during the increment.
+    _budget_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
+
     # --------------------------------------------------------------
     # Public API
     # --------------------------------------------------------------
@@ -81,12 +90,15 @@ class Dispatcher:
         conversationally rather than the CLI crashing out.
         """
         # --- Budget check (before anything else so runaway loops stop early).
-        if self.calls_made >= self.budget:
-            return self._refuse(
-                name, args, reason="budget exhausted",
-                error="budget_exhausted",
-            )
-        self.calls_made += 1
+        # Atomic under concurrent dispatch via ``_budget_lock`` — otherwise
+        # a burst of N parallel calls could slip past a budget of M < N.
+        with self._budget_lock:
+            if self.calls_made >= self.budget:
+                return self._refuse(
+                    name, args, reason="budget exhausted",
+                    error="budget_exhausted",
+                )
+            self.calls_made += 1
 
         # --- Lookup.
         try:

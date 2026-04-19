@@ -56,6 +56,12 @@ class Config:
     # --- Agent loop ---
     agent_max_turns: int = 8          # upper bound on tool-call turns per ask
     agent_tool_cache: bool = True     # enable per-session READ-tool memoization
+    # Parallel tool dispatch (item #20). When the model emits multiple
+    # tool_calls in a single turn, fan them out across a thread pool of
+    # this size. Value is clamped to [1, 16] at use-time so a misconfigured
+    # profile cannot create a thread storm; setting it to ``1`` restores
+    # the legacy serial path and skips ``ThreadPoolExecutor`` entirely.
+    agent_tool_concurrency: int = 4
 
     # --- Web search tool (item #16) ---
     # Pluggable backend selector — see gemma/tools/backends/ for the
