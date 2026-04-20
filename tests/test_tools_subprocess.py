@@ -96,7 +96,7 @@ def test_env_scrub_removes_credentials(monkeypatch, tmp_path):
             "print(json.dumps({k: os.environ.get(k, '') "
             "for k in ['AWS_SECRET_ACCESS_KEY', 'OLLAMA_API_KEY', 'PATH']}))"
         ),
-        cwd=tmp_path, timeout_s=5, max_output_bytes=1024,
+        cwd=tmp_path, timeout_s=5, max_output_bytes=65536,
     )
     assert result.exit_code == 0
     import json

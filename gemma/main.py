@@ -77,7 +77,7 @@ from gemma.completion import profile_completer
 from gemma.config import Config
 from gemma.history import SessionHistory
 from gemma.memory import MemoryManager
-from gemma.output import OutputMode, render_response
+from gemma.output import OutputMode, display_context_metrics, render_response
 from gemma.session import GemmaSession
 
 
@@ -487,6 +487,7 @@ def _agent_loop(
     session_cache: Optional[Any] = None,
     session_id: str = "agent",
     _plan_depth: int = 0,
+    metrics_out: Optional[Dict[str, int]] = None,
 ) -> tuple[str, bool]:
     """OpenAI-style tool-use loop for ``gemma ask``.
 
@@ -560,6 +561,13 @@ def _agent_loop(
             keep_alive=cfg.ollama_keep_alive,
             options={"temperature": cfg.temperature},
         )
+
+        # Accumulate token counts across turns for the caller's metrics footer.
+        if metrics_out is not None:
+            def _gi(key: str) -> int:
+                return int((raw.get(key) if isinstance(raw, dict) else getattr(raw, key, 0)) or 0)
+            metrics_out["prompt_eval_count"] = metrics_out.get("prompt_eval_count", 0) + _gi("prompt_eval_count")
+            metrics_out["eval_count"] = metrics_out.get("eval_count", 0) + _gi("eval_count")
 
         # Unify dict-style and Ollama SDK object access.
         msg = raw["message"] if isinstance(raw, dict) else raw.message
@@ -751,7 +759,7 @@ def ask(
     system: Optional[str] = typer.Option(None, "--system", "-s"),
     no_stream: bool = typer.Option(False, "--no-stream"),
     no_memory: bool = typer.Option(False, "--no-memory", help="Skip memory retrieval."),
-    think: bool = typer.Option(False, "--think", help="Enable Gemma 4 extended thinking mode."),
+    think: bool = typer.Option(True, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (on by default)."),
     keep_alive: Optional[str] = typer.Option(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",
@@ -809,7 +817,8 @@ def ask(
 
         if cached is not None:
             reply, _finished = render_response(
-                iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model
+                iter([("content", cached)]), mode=mode, stream=False, field=field, model=cfg.model,
+                context_window=cfg.context_window, show_metrics=False,
             )
             if memory is not None and memory.available:
                 memory.record_turn("assistant", reply)
@@ -857,22 +866,32 @@ def ask(
                 from gemma.agent.cache import AgentSessionCache
                 session_cache = AgentSessionCache()
 
+            agent_metrics: dict = {}
             reply, _exhausted = _agent_loop(
                 ollama_client, cfg, messages, tool_schemas,
                 cfg.agent_max_turns,
                 dispatch=dispatcher.dispatch,
                 session_cache=session_cache,
                 session_id=getattr(session, "_session_id", "ask"),
+                metrics_out=agent_metrics,
             )
 
             # Render the final reply via the standard output path.
             reply, finished = render_response(
-                iter([("content", reply)]), mode=mode, stream=False, field=field, model=cfg.model
+                iter([("content", reply)]), mode=mode, stream=False, field=field, model=cfg.model,
+                context_window=cfg.context_window, show_metrics=False,
             )
+            if cfg.show_context_metrics and agent_metrics:
+                display_context_metrics(
+                    agent_metrics.get("prompt_eval_count", 0),
+                    agent_metrics.get("eval_count", 0),
+                    cfg.context_window,
+                )
         else:
             gen = client_chat(messages, cfg, stream=not no_stream)
             reply, finished = render_response(
-                gen, mode=mode, stream=not no_stream, field=field, model=cfg.model
+                gen, mode=mode, stream=not no_stream, field=field, model=cfg.model,
+                context_window=cfg.context_window, show_metrics=cfg.show_context_metrics,
             )
             finished = True  # ensure cache write below triggers
 
@@ -893,7 +912,7 @@ def chat(
     system: Optional[str] = typer.Option(None, "--system", "-s"),
     fresh: bool = typer.Option(False, "--fresh", help="Start with an empty sliding window."),
     no_memory: bool = typer.Option(False, "--no-memory", help="Disable all memory features."),
-    think: bool = typer.Option(False, "--think", help="Enable Gemma 4 extended thinking mode."),
+    think: bool = typer.Option(True, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (on by default)."),
     keep_alive: Optional[str] = typer.Option(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",
@@ -937,7 +956,10 @@ def chat(
 
             console.print("[bold green]gemma>[/bold green] ", end="")
             gen = client_chat(messages, cfg, stream=True)
-            reply, _finished = render_response(gen, mode=OutputMode.RICH, stream=True, model=cfg.model)
+            reply, _finished = render_response(
+                gen, mode=OutputMode.RICH, stream=True, model=cfg.model,
+                context_window=cfg.context_window, show_metrics=cfg.show_context_metrics,
+            )
             memory.record_turn("assistant", reply)
 
 

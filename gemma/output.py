@@ -50,26 +50,56 @@ class OutputMode(Enum):
     CODE = "code"
 
 
+def display_context_metrics(
+    prompt_tokens: int,
+    eval_tokens: int,
+    context_window: int = 128000,
+) -> None:
+    """Print a dim token-count footer after a response.
+
+    Args:
+        prompt_tokens:  Tokens consumed by the prompt (Ollama prompt_eval_count).
+        eval_tokens:    Tokens generated in the completion (Ollama eval_count).
+        context_window: Model context window size for the usage percentage.
+    """
+    if not (prompt_tokens or eval_tokens):
+        return
+    total = prompt_tokens + eval_tokens
+    pct = int(100 * total / context_window) if context_window else 0
+    console.print(
+        f"[dim]● {prompt_tokens:,} prompt + {eval_tokens:,} completion "
+        f"= {total:,} tokens  ({pct}% of {context_window:,} ctx)[/dim]"
+    )
+
+
 def render_response(
     generator: Iterator[Tuple[str, str]],
     mode: OutputMode = OutputMode.RICH,
     stream: bool = True,
     field: Optional[str] = None,
     model: Optional[str] = None,
+    context_window: int = 128000,
+    show_metrics: bool = True,
 ) -> Tuple[str, bool]:
     """Consume a response generator and render output according to *mode*.
 
     The generator yields ``(chunk_type, text)`` tuples where *chunk_type* is
-    ``"think"`` (extended reasoning, shown dimmed in RICH mode) or
-    ``"content"`` (the actual response text).
+    ``"think"`` (extended reasoning, shown dimmed in RICH mode),
+    ``"content"`` (the actual response text), or ``"metrics"`` (a JSON string
+    with prompt/completion token counts, emitted once at the end by
+    ``gemma.client``).
 
     Args:
-        generator: Iterable yielding ``(chunk_type, text)`` pairs.
-        mode:      How to format and emit the response.
-        stream:    For RICH mode only — stream chunks as they arrive
-                   (``True``) or buffer and render as Markdown (``False``).
-        field:     For ONLY mode — the JSON field name to print.
-        model:     Model tag included in JSON / ONLY output.
+        generator:      Iterable yielding ``(chunk_type, text)`` pairs.
+        mode:           How to format and emit the response.
+        stream:         For RICH mode only — stream chunks as they arrive
+                        (``True``) or buffer and render as Markdown (``False``).
+        field:          For ONLY mode — the JSON field name to print.
+        model:          Model tag included in JSON / ONLY output.
+        context_window: Model context window size used to compute the usage
+                        percentage in the metrics footer.
+        show_metrics:   When True (default), print a dim token-count footer
+                        after the response in RICH mode.
 
     Returns:
         ``(reply, finished)`` where ``reply`` is the full response text
@@ -81,17 +111,22 @@ def render_response(
     start = time.monotonic()
     chunks: list[str] = []
     thinking_parts: list[str] = []
+    metrics_parts: list[str] = []
     finished = False
 
     if mode == OutputMode.RICH:
         # Streaming path — render inline as chunks arrive.
-        finished = _render_rich(generator, stream, chunks, thinking_parts)
+        finished = _render_rich(generator, stream, chunks, thinking_parts, metrics_parts)
+        if show_metrics and metrics_parts:
+            _apply_metrics(metrics_parts[-1], context_window)
     else:
         # Non-streaming: collect everything first, then render.
         try:
             for chunk_type, text in generator:
                 if chunk_type == "think":
                     thinking_parts.append(text)
+                elif chunk_type == "metrics":
+                    metrics_parts.append(text)
                 else:
                     chunks.append(text)
             finished = True
@@ -115,22 +150,42 @@ def render_response(
 # Private renderers
 # ---------------------------------------------------------------------------
 
+def _apply_metrics(metrics_raw: str, context_window: int) -> None:
+    """Parse a metrics JSON string and call display_context_metrics.
+
+    Args:
+        metrics_raw:    JSON string with 'prompt_eval_count' and 'eval_count'.
+        context_window: Passed through to display_context_metrics.
+    """
+    try:
+        m = json.loads(metrics_raw)
+        display_context_metrics(
+            m.get("prompt_eval_count", 0),
+            m.get("eval_count", 0),
+            context_window,
+        )
+    except Exception:
+        pass
+
+
 def _render_rich(
     generator: Iterator[Tuple[str, str]],
     stream: bool,
     chunks: list[str],
     thinking_parts: list[str],
+    metrics_parts: list[str],
 ) -> bool:
     """Render in RICH mode (streaming or batched Markdown).
 
-    Mutates *chunks* and *thinking_parts* in-place so the caller has the
-    collected text available after return.
+    Mutates *chunks*, *thinking_parts*, and *metrics_parts* in-place so the
+    caller has the collected text available after return.
 
     Args:
-        generator:     Source of (chunk_type, text) pairs.
-        stream:        True → print each chunk as it arrives.
-        chunks:        Accumulator for content chunks.
+        generator:      Source of (chunk_type, text) pairs.
+        stream:         True → print each chunk as it arrives.
+        chunks:         Accumulator for content chunks.
         thinking_parts: Accumulator for thinking chunks.
+        metrics_parts:  Accumulator for metrics JSON strings.
 
     Returns:
         True only when the generator was consumed cleanly to its end.
@@ -147,6 +202,8 @@ def _render_rich(
                         console.print("[dim italic]thinking…[/dim italic]")
                         had_thinking = True
                     console.print(text, end="", soft_wrap=True, highlight=False, style="dim italic")
+                elif chunk_type == "metrics":
+                    metrics_parts.append(text)
                 else:
                     if had_thinking and first_content:
                         console.print()  # newline after the last thinking chunk
@@ -163,6 +220,8 @@ def _render_rich(
             for chunk_type, text in generator:
                 if chunk_type == "think":
                     thinking_parts.append(text)
+                elif chunk_type == "metrics":
+                    metrics_parts.append(text)
                 else:
                     chunks.append(text)
         except Exception:

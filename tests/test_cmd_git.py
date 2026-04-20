@@ -143,7 +143,7 @@ class TestCommitCommand:
 
         monkeypatch.chdir(git_repo)
         with patch("gemma.commands.git.client_chat", side_effect=_capture):
-            result = runner.invoke(app, ["commit", "--type", "chore"])
+            result = runner.invoke(app, ["commit", "--type", "chore", "--no-cache"])
         assert result.exit_code == 0
         assert any("chore" in msg for msg in captured)
 
@@ -157,7 +157,7 @@ class TestCommitCommand:
 
         monkeypatch.chdir(git_repo)
         with patch("gemma.commands.git.client_chat", side_effect=_capture):
-            runner.invoke(app, ["commit", "--keep-alive", "1h"])
+            runner.invoke(app, ["commit", "--keep-alive", "1h", "--no-cache"])
         assert captured.get("keep_alive") == "1h"
 
 
@@ -194,7 +194,7 @@ class TestCommitErrors:
 
         monkeypatch.chdir(git_repo)
         with patch("gemma.commands.git.client_chat", side_effect=_boom):
-            result = runner.invoke(app, ["commit"])
+            result = runner.invoke(app, ["commit", "--no-cache"])
         assert result.exit_code != 0
 
     def test_empty_model_response_exits_nonzero(self, git_repo, monkeypatch):
@@ -203,7 +203,7 @@ class TestCommitErrors:
 
         monkeypatch.chdir(git_repo)
         with patch("gemma.commands.git.client_chat", side_effect=_empty):
-            result = runner.invoke(app, ["commit"])
+            result = runner.invoke(app, ["commit", "--no-cache"])
         assert result.exit_code != 0
 
 
@@ -237,7 +237,7 @@ class TestDiffCommand:
 
         monkeypatch.chdir(git_repo_unstaged)
         with patch("gemma.commands.git.client_chat", side_effect=_capture):
-            result = runner.invoke(app, ["diff", "--overall"])
+            result = runner.invoke(app, ["diff", "--overall", "--no-cache"])
         assert result.exit_code == 0
         # The overall system prompt contains "prose" to signal a paragraph mode.
         sys_msgs = [m for m in captured if "prose" in m.lower()]
@@ -287,7 +287,7 @@ class TestDiffErrors:
 
         monkeypatch.chdir(git_repo_unstaged)
         with patch("gemma.commands.git.client_chat", side_effect=_boom):
-            result = runner.invoke(app, ["diff"])
+            result = runner.invoke(app, ["diff", "--no-cache"])
         assert result.exit_code != 0
 
     def test_empty_model_response_exits_nonzero(self, git_repo_unstaged, monkeypatch):
@@ -296,7 +296,7 @@ class TestDiffErrors:
 
         monkeypatch.chdir(git_repo_unstaged)
         with patch("gemma.commands.git.client_chat", side_effect=_empty):
-            result = runner.invoke(app, ["diff"])
+            result = runner.invoke(app, ["diff", "--no-cache"])
         assert result.exit_code != 0
 
 

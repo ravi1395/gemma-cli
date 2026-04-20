@@ -42,11 +42,12 @@ class Config:
     context_window: int = 128000
     history_file: str = "~/.gemma_history.json"
     ollama_host: str = "http://localhost:11434"
-    thinking_mode: bool = False  # Enable Gemma 4 extended thinking (shows reasoning before response)
+    thinking_mode: bool = True   # Enable Gemma 4 extended thinking (shows reasoning before response)
     # How long Ollama should keep the model resident in RAM between calls.
     # Any duration string accepted by Ollama ("30m", "2h", "-1" = forever, "0" = evict).
     # Keeps TTFT low across repeated CLI invocations in the same shell session.
     ollama_keep_alive: str = "30m"
+    show_context_metrics: bool = True  # Print token-count footer after each response
 
     # --- Response cache ---
     cache_enabled: bool = True

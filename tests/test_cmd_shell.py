@@ -86,7 +86,7 @@ class TestShCommand:
             yield  # make it a generator
 
         with patch("gemma.commands.shell.client_chat", side_effect=_boom):
-            result = runner.invoke(app, ["sh", "--no-exec", "list files"])
+            result = runner.invoke(app, ["sh", "--no-exec", "--no-cache", "list files"])
         assert result.exit_code != 0
 
     def test_missing_prompt_argument_exits_nonzero(self):
@@ -108,7 +108,7 @@ class TestShCommand:
             yield ("content", "ls -la")
 
         with patch("gemma.commands.shell.client_chat", side_effect=_capture):
-            result = runner.invoke(app, ["sh", "--no-exec", "--keep-alive", "2h", "list files"])
+            result = runner.invoke(app, ["sh", "--no-exec", "--keep-alive", "2h", "--no-cache", "list files"])
         assert result.exit_code == 0
         assert captured.get("keep_alive") == "2h"
 

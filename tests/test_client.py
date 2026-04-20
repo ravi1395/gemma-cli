@@ -45,7 +45,8 @@ def test_ask_streams_tokens(mock_client_cls, config):
     mock_inst.chat.return_value = _fake_stream(["Hello ", "world"])
     mock_client_cls.return_value = mock_inst
 
-    result = "".join(text for _, text in ask("hi", config, stream=True))
+    # Filter out "metrics" chunks — callers that only want the response text do this.
+    result = "".join(text for t, text in ask("hi", config, stream=True) if t == "content")
 
     assert result == "Hello world"
     mock_inst.chat.assert_called_once()
@@ -63,7 +64,7 @@ def test_ask_blocking_returns_full_text(mock_client_cls, config):
     mock_inst.chat.return_value = _fake_blocking("done")
     mock_client_cls.return_value = mock_inst
 
-    result = "".join(text for _, text in ask("hi", config, stream=False))
+    result = "".join(text for t, text in ask("hi", config, stream=False) if t == "content")
 
     assert result == "done"
     assert mock_inst.chat.call_args.kwargs["stream"] is False
@@ -93,7 +94,7 @@ def test_chat_passes_messages_through(mock_client_cls, config):
         {"role": "assistant", "content": "a1"},
         {"role": "user", "content": "q2"},
     ]
-    result = "".join(text for _, text in chat(msgs, config, stream=True))
+    result = "".join(text for t, text in chat(msgs, config, stream=True) if t == "content")
 
     assert result == "reply"
     assert mock_inst.chat.call_args.kwargs["messages"] == msgs
@@ -110,7 +111,6 @@ def test_thinking_mode_streaming(mock_client_cls, config):
     tuples = list(ask("hi", config, stream=True))
 
     types = [t for t, _ in tuples]
-    texts = [v for _, v in tuples]
     assert "think" in types
     assert "content" in types
     assert "".join(v for t, v in tuples if t == "think") == "let me reason"
@@ -133,8 +133,21 @@ def test_thinking_mode_blocking(mock_client_cls, config):
 
 
 @patch("gemma.client.ollama.Client")
-def test_thinking_mode_off_by_default(mock_client_cls, config):
-    """think=False is passed to Ollama when thinking_mode is off."""
+def test_thinking_mode_on_by_default(mock_client_cls, config):
+    """think=True is passed to Ollama when thinking_mode is on (now the default)."""
+    mock_inst = MagicMock()
+    mock_inst.chat.return_value = _fake_stream(["hi"])
+    mock_client_cls.return_value = mock_inst
+
+    list(ask("hello", config, stream=True))
+
+    assert mock_inst.chat.call_args.kwargs["think"] is True
+
+
+@patch("gemma.client.ollama.Client")
+def test_thinking_mode_can_be_disabled(mock_client_cls, config):
+    """think=False is passed to Ollama when thinking_mode is explicitly set to False."""
+    config.thinking_mode = False
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_stream(["hi"])
     mock_client_cls.return_value = mock_inst
@@ -155,3 +168,24 @@ def test_keep_alive_propagated(mock_client_cls, config):
     list(ask("hi", config, stream=True))
 
     assert mock_inst.chat.call_args.kwargs["keep_alive"] == "2h"
+
+
+@patch("gemma.client.ollama.Client")
+def test_metrics_chunk_yielded_at_end_of_stream(mock_client_cls, config):
+    """A ('metrics', json_str) tuple is yielded after the last content chunk."""
+    import json as _json
+    mock_inst = MagicMock()
+    # Last chunk carries token counts
+    chunks = list(_fake_stream(["hello"]))
+    chunks[-1]["prompt_eval_count"] = 10
+    chunks[-1]["eval_count"] = 5
+    mock_inst.chat.return_value = iter(chunks)
+    mock_client_cls.return_value = mock_inst
+
+    tuples = list(ask("hi", config, stream=True))
+    metrics_tuples = [(t, v) for t, v in tuples if t == "metrics"]
+
+    assert len(metrics_tuples) == 1
+    m = _json.loads(metrics_tuples[0][1])
+    assert m["prompt_eval_count"] == 10
+    assert m["eval_count"] == 5

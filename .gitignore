@@ -1,2 +1,6 @@
 docs/perf/*
 docs/tasks/*
+
+**/__pycache__/
+*.py[cod]
+*.pyo
