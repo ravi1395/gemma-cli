@@ -133,21 +133,8 @@ def test_thinking_mode_blocking(mock_client_cls, config):
 
 
 @patch("gemma.client.ollama.Client")
-def test_thinking_mode_on_by_default(mock_client_cls, config):
-    """think=True is passed to Ollama when thinking_mode is on (now the default)."""
-    mock_inst = MagicMock()
-    mock_inst.chat.return_value = _fake_stream(["hi"])
-    mock_client_cls.return_value = mock_inst
-
-    list(ask("hello", config, stream=True))
-
-    assert mock_inst.chat.call_args.kwargs["think"] is True
-
-
-@patch("gemma.client.ollama.Client")
-def test_thinking_mode_can_be_disabled(mock_client_cls, config):
-    """think=False is passed to Ollama when thinking_mode is explicitly set to False."""
-    config.thinking_mode = False
+def test_thinking_mode_off_by_default(mock_client_cls, config):
+    """think=False is passed to Ollama when thinking_mode is off (the default)."""
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_stream(["hi"])
     mock_client_cls.return_value = mock_inst
@@ -155,6 +142,19 @@ def test_thinking_mode_can_be_disabled(mock_client_cls, config):
     list(ask("hello", config, stream=True))
 
     assert mock_inst.chat.call_args.kwargs["think"] is False
+
+
+@patch("gemma.client.ollama.Client")
+def test_thinking_mode_can_be_enabled(mock_client_cls, config):
+    """think=True is passed to Ollama when thinking_mode is explicitly set to True."""
+    config.thinking_mode = True
+    mock_inst = MagicMock()
+    mock_inst.chat.return_value = _fake_stream(["hi"])
+    mock_client_cls.return_value = mock_inst
+
+    list(ask("hello", config, stream=True))
+
+    assert mock_inst.chat.call_args.kwargs["think"] is True
 
 
 @patch("gemma.client.ollama.Client")

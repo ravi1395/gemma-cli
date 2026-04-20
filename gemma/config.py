@@ -36,17 +36,22 @@ class Config:
     """
 
     # --- Base CLI ---
-    model: str = "gemma4:e4b"
+    model: str = "gemma4:e4b-it-q5_K_M"
     system_prompt: str = "You are a helpful assistant."
     temperature: float = 0.7
-    context_window: int = 128000
+    # Ollama pre-allocates a KV cache sized to this value, independent of the
+    # actual prompt length — 16k covers chat / ask / commit / sh / code review
+    # comfortably while keeping KV cache in the hundreds of MB rather than
+    # multiple GB. Bump via profile for long-document RAG or sessions that
+    # approach 100+ turns, but expect a proportional jump in resident memory.
+    context_window: int = 16384
     history_file: str = "~/.gemma_history.json"
     ollama_host: str = "http://localhost:11434"
-    thinking_mode: bool = True   # Enable Gemma 4 extended thinking (shows reasoning before response)
+    thinking_mode: bool = False  # Gemma 4 extended thinking — off by default (opt-in via --think or profile; roughly doubles tokens per query)
     # How long Ollama should keep the model resident in RAM between calls.
     # Any duration string accepted by Ollama ("30m", "2h", "-1" = forever, "0" = evict).
     # Keeps TTFT low across repeated CLI invocations in the same shell session.
-    ollama_keep_alive: str = "30m"
+    ollama_keep_alive: str = "2m"
     show_context_metrics: bool = True  # Print token-count footer after each response
 
     # --- Response cache ---

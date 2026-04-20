@@ -22,6 +22,7 @@ A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backe
   - [Quick setup (recommended)](#quick-setup-recommended)
   - [Quick setup — Windows](#quick-setup--windows)
   - [Manual setup](#manual-setup)
+- [Reducing Ollama memory footprint](#reducing-ollama-memory-footprint)
 - [Running Redis](#running-redis)
   - [Native (macOS)](#native-macos)
   - [Native (Linux)](#native-linux)
@@ -315,7 +316,7 @@ The models share unified memory on Apple Silicon with `nomic-embed-text` (~274 M
 
 | Model | Approx. size (Q4) | 16 GB Mac | 24 GB Mac | 32 GB+ Mac |
 |---|---|---|---|---|
-| `gemma4:e4b` | ~3–4 GB | Comfortable | Comfortable | Comfortable |
+| `gemma4:e4b-it-q5_K_M` | ~3–4 GB | Comfortable | Comfortable | Comfortable |
 | `gemma4:12b` | ~8 GB | Tight — leaves ~7 GB for OS + nomic | Comfortable | Comfortable |
 | `gemma4:27b` | ~16 GB | Will page to swap — avoid | Marginal | Comfortable |
 
@@ -351,7 +352,7 @@ chmod +x setup.sh
 4. Installs gemma-cli with all dependencies (`pip install -e ".[memory,dev]"`)
 5. Ensures Redis is running — installs natively (`brew install redis` on macOS, `apt-get`/`dnf` on Linux); falls back to Docker only if Docker is already available and a native install cannot be performed
 6. Installs Ollama if missing (`brew install ollama` on macOS, official install script on Linux)
-7. Pulls `gemma4:e4b` (~3–4 GB) and `nomic-embed-text` (~274 MB) into Ollama
+7. Pulls `gemma4:e4b-it-q5_K_M` (~3–4 GB) and `nomic-embed-text` (~274 MB) into Ollama
 8. Runs the full test suite to confirm everything is wired up
 
 ```bash
@@ -381,7 +382,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 3. Installs gemma-cli with all dependencies
 4. Ensures Redis is running — installs via `winget`/Chocolatey or [Memurai](https://www.memurai.com/) (Redis-compatible for Windows); falls back to Docker if already available
 5. Installs Ollama if missing (via `winget` or `choco`)
-6. Pulls `gemma4:e4b` and `nomic-embed-text` into Ollama
+6. Pulls `gemma4:e4b-it-q5_K_M` and `nomic-embed-text` into Ollama
 7. Runs the full test suite
 
 ```powershell
@@ -403,7 +404,7 @@ cd gemma-cli
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[memory]"
-ollama pull gemma4:e4b
+ollama pull gemma4:e4b-it-q5_K_M
 ollama pull nomic-embed-text
 ```
 
@@ -414,9 +415,62 @@ cd gemma-cli
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e ".[memory]"
-ollama pull gemma4:e4b
+ollama pull gemma4:e4b-it-q5_K_M
 ollama pull nomic-embed-text
 ```
+
+---
+
+## Reducing Ollama memory footprint
+
+gemma-cli's defaults already lean memory-conscious (q5 weights, 16k context, 2-minute keep-alive — see [Configuration reference](#configuration-reference)). A few more levers live **on the Ollama server side** and can't be set from the CLI or a profile — they need to be exported in whatever launches `ollama serve` (LaunchAgent on macOS, shell rc, or systemd unit on Linux).
+
+| Env var | Value | Effect |
+|---|---|---|
+| `OLLAMA_FLASH_ATTENTION` | `1` | Required before `OLLAMA_KV_CACHE_TYPE` is honoured. Enables Flash-Attention kernels. |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` (or `q4_0`) | Quantizes the KV cache. `q8_0` halves KV memory with no measurable quality loss; `q4_0` quarters it with a small hit on long-context recall. |
+| `OLLAMA_NUM_PARALLEL` | `1` | Serialize requests instead of running up to 4 slots in parallel. Each slot duplicates the KV cache. |
+| `OLLAMA_MAX_LOADED_MODELS` | `1` | Don't hold the chat and embedding models resident at the same time. Matters on ≤16 GB machines when `warm_start = true`. |
+
+### macOS (menu-bar app)
+
+The Ollama desktop app reads env vars from `launchctl`:
+
+```bash
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+launchctl setenv OLLAMA_NUM_PARALLEL 1
+launchctl setenv OLLAMA_MAX_LOADED_MODELS 1
+# Quit and relaunch Ollama from the menu bar for the vars to take effect.
+```
+
+### macOS / Linux (`ollama serve` manually)
+
+Add to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+export OLLAMA_NUM_PARALLEL=1
+export OLLAMA_MAX_LOADED_MODELS=1
+```
+
+Then restart the daemon (`pkill ollama && ollama serve`) to pick them up.
+
+### Linux (systemd)
+
+```bash
+sudo systemctl edit ollama
+```
+Add:
+```ini
+[Service]
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+```
+Then `sudo systemctl restart ollama`.
 
 ---
 
@@ -526,12 +580,12 @@ gemma ask "What did we decide about the auth layer?" --keep-alive 2h
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model for this call |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model for this call |
 | `--system`, `-s` | (config default) | Override the system prompt |
 | `--no-stream` | off | Collect the full response, then render as Markdown |
 | `--no-memory` | off | Skip memory retrieval and recording |
 | `--think` | off | Enable Gemma 4 extended thinking mode |
-| `--keep-alive` | `30m` | How long Ollama keeps the model in RAM after this call (`"2h"`, `"-1"` to pin, `"0"` to evict) |
+| `--keep-alive` | `2m` | How long Ollama keeps the model in RAM after this call (`"2h"`, `"-1"` to pin, `"0"` to evict) |
 | `--json` | off | Emit a JSON object (`content`, `model`, `elapsed_ms`, `cache_hit`) |
 | `--only <field>` | — | Print a single JSON field naked (mutually exclusive with `--json`/`--code`) |
 | `--code` | off | Extract and emit only fenced code blocks (mutually exclusive with `--json`/`--only`) |
@@ -566,19 +620,19 @@ Type `exit`, `quit`, or `:q` (or press `Ctrl-D`) to quit.
 The status line shows the current model and memory mode:
 
 ```
-gemma chat (gemma4:e4b, memory mode) -- type 'exit' or Ctrl-D to quit
+gemma chat (gemma4:e4b-it-q5_K_M, memory mode) -- type 'exit' or Ctrl-D to quit
 ```
 
 Memory mode will show `degraded mode` if Redis is unreachable, and the CLI will still work using an in-memory fallback.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
 | `--system`, `-s` | (config default) | Override the system prompt |
 | `--fresh` | off | Clear the raw sliding window before starting (condensed memories are kept) |
 | `--no-memory` | off | Disable all memory features |
 | `--think` | off | Enable Gemma 4 extended thinking mode |
-| `--keep-alive` | `30m` | How long Ollama keeps the model in RAM between turns (`"2h"`, `"-1"` to pin, `"0"` to evict) |
+| `--keep-alive` | `2m` | How long Ollama keeps the model in RAM between turns (`"2h"`, `"-1"` to pin, `"0"` to evict) |
 
 ---
 
@@ -602,7 +656,7 @@ cat report.md | gemma pipe "Extract action items" --no-stream
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
 | `--no-stream` | off | Collect and render as Markdown instead of streaming |
 | `--json` | off | Emit a JSON object (`content`, `model`, `elapsed_ms`, `cache_hit`) |
 | `--only <field>` | — | Print a single JSON field naked (mutually exclusive with `--json`/`--code`) |
@@ -716,13 +770,14 @@ gemma --profile code ask "review this" --model gemma4:27b
 
 ### Example profiles
 
-Three starter profiles are included in [`examples/profiles/`](examples/profiles/):
+Four starter profiles are included in [`examples/profiles/`](examples/profiles/):
 
 | File | Purpose |
 |---|---|
 | `code.toml` | Code review: `gemma4:12b`, low temperature, concise output |
 | `verbose.toml` | Teaching mode: detailed step-by-step explanations |
 | `fast.toml` | Quick lookups: smallest model, pinned in RAM, minimal memory overhead |
+| `low-memory.toml` | 16 GB machines: q4 quant, evict-on-idle, no embed preload, memory off |
 
 Copy them to `~/.config/gemma/profiles/` to use:
 
@@ -751,7 +806,7 @@ gemma ask --json "what model are you?" | jq '{model, elapsed_ms}'
 Output shape:
 
 ```json
-{"content": "...", "model": "gemma4:e4b", "elapsed_ms": 1842, "cache_hit": false}
+{"content": "...", "model": "gemma4:e4b-it-q5_K_M", "elapsed_ms": 1842, "cache_hit": false}
 ```
 
 ### `--only <field>`
@@ -927,8 +982,8 @@ The command is generated at `temperature=0.2` to minimise hallucination. A small
 | `--no-exec` | off | Print the command only; never prompt to run |
 | `--shell` | `$SHELL` | Target shell syntax: `bash`, `zsh`, `sh` |
 | `--explain` | off | Prepend a `#` comment describing what the command does |
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
-| `--keep-alive` | `30m` | Ollama model-residency duration |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
+| `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
 
@@ -963,8 +1018,8 @@ gemma explain --cmd "git rebase -i HEAD~5" --with-memory
 | `--lines`, `-n` | all (≤20 KB) | For file mode: read only the first N lines |
 | `--with-memory` | off | Retrieve relevant Redis context before answering |
 | `--no-stream` | off | Collect then render as Markdown |
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
-| `--keep-alive` | `30m` | Ollama model-residency duration |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
+| `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
 
@@ -1001,8 +1056,8 @@ Without `--apply` the message is printed for review and you can copy it manually
 |---|---|---|
 | `--apply` | off | Create the commit after generating the message |
 | `--type` | (model decides) | Force a conventional-commit type: `feat`, `fix`, `chore`, `docs`, … |
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
-| `--keep-alive` | `30m` | Ollama model-residency duration |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
+| `--keep-alive` | `2m` | Ollama model-residency duration |
 
 > **Note:** if `commit.gpgsign = true` is set in your git config, `git commit` will invoke your signing key as normal. `gemma commit` does not bypass signing.
 
@@ -1039,8 +1094,8 @@ tests/test_auth.py — adds three unit tests covering the new JWT helper.
 |---|---|---|
 | `--staged` / `--cached` | off | Diff the staging area instead of the working tree |
 | `--overall` | off | One prose paragraph instead of per-file summaries |
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
-| `--keep-alive` | `30m` | Ollama model-residency duration |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
+| `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
 
@@ -1066,8 +1121,8 @@ gemma why --last-file /tmp/my_last_cmd
 | Flag | Default | Description |
 |---|---|---|
 | `--last-file` | `~/.gemma_last_cmd` | Path to the last-command record (also read from `$GEMMA_LAST_FILE`) |
-| `--model`, `-m` | `gemma4:e4b` | Override the Ollama model |
-| `--keep-alive` | `30m` | Ollama model-residency duration |
+| `--model`, `-m` | `gemma4:e4b-it-q5_K_M` | Override the Ollama model |
+| `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
 
@@ -1111,15 +1166,15 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 
 | Field | Default | Description |
 |---|---|---|
-| `model` | `gemma4:e4b` | Ollama model tag for chat and condensation |
+| `model` | `gemma4:e4b-it-q5_K_M` | Ollama model tag for chat and condensation |
 | `system_prompt` | `"You are a helpful assistant."` | Default system message |
 | `temperature` | `0.7` | Sampling temperature for chat (condensation always uses 0.2) |
-| `context_window` | `128000` | Total token budget; 75% is used for input, 25% reserved for response |
+| `context_window` | `16384` | Total token budget; 75% is used for input, 25% reserved for response |
 | `history_file` | `~/.gemma_history.json` | Path for the JSON fallback session history |
 | `ollama_host` | `http://localhost:11434` | Ollama server base URL |
 | `memory_enabled` | `True` | Master switch; set `False` to disable all Redis/embedding features |
 | `thinking_mode` | `False` | Enable Gemma 4 extended thinking; the model reasons step-by-step before responding |
-| `ollama_keep_alive` | `"30m"` | How long Ollama keeps the model loaded in RAM between calls. Accepts duration strings (`"30m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
+| `ollama_keep_alive` | `"2m"` | How long Ollama keeps the model loaded in RAM between calls. Accepts duration strings (`"2m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
 | `cache_enabled` | `True` | Master switch for the SHA-keyed response cache |
 | `cache_ttl_seconds` | `3600` | Cache entry TTL in seconds; `0` disables all caching |
 | `cache_temperature_max` | `0.3` | Skip caching for calls with temperature above this value |

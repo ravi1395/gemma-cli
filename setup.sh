@@ -8,7 +8,7 @@
 #   4. Installs gemma-cli with memory + dev extras into the venv
 #   5. Ensures Redis is running — installs it natively (brew/apt/dnf) if needed;
 #      falls back to Docker only if Docker is already available
-#   6. Pulls gemma4:e4b and nomic-embed-text into Ollama (skipped per model if already present)
+#   6. Pulls gemma4:e4b-it-q5_K_M and nomic-embed-text into Ollama (skipped per model if already present)
 #   7. Runs the test suite to confirm everything wired up correctly
 #
 # Usage:
@@ -293,7 +293,7 @@ fi
 
 step "Pulling Ollama models"
 
-CHAT_MODEL="gemma4:e4b"
+CHAT_MODEL="gemma4:e4b-it-q5_K_M"
 EMBED_MODEL="nomic-embed-text"
 
 pull_model_if_missing() {

@@ -759,7 +759,7 @@ def ask(
     system: Optional[str] = typer.Option(None, "--system", "-s"),
     no_stream: bool = typer.Option(False, "--no-stream"),
     no_memory: bool = typer.Option(False, "--no-memory", help="Skip memory retrieval."),
-    think: bool = typer.Option(True, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (on by default)."),
+    think: bool = typer.Option(False, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (off by default; adds a reasoning pass that roughly doubles tokens generated)."),
     keep_alive: Optional[str] = typer.Option(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",
@@ -912,7 +912,7 @@ def chat(
     system: Optional[str] = typer.Option(None, "--system", "-s"),
     fresh: bool = typer.Option(False, "--fresh", help="Start with an empty sliding window."),
     no_memory: bool = typer.Option(False, "--no-memory", help="Disable all memory features."),
-    think: bool = typer.Option(True, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (on by default)."),
+    think: bool = typer.Option(False, "--think/--no-think", help="Enable Gemma 4 extended thinking mode (off by default; adds a reasoning pass that roughly doubles tokens generated)."),
     keep_alive: Optional[str] = typer.Option(
         None, "--keep-alive",
         help="Ollama model-residency duration (e.g. '30m', '2h', '-1' to pin, '0' to evict).",

@@ -1,0 +1,40 @@
+# Low-memory profile — for machines where RAM is tight (<=16 GB) and
+# sustained Ollama residency + embedding-model preload cause swap pressure.
+#
+# gemma --profile low-memory ask "..."
+#
+# Trade-off: expect ~1–3s of extra TTFT on the first query in a shell
+# session (weights must reload), in exchange for ~6–8 GB of RAM freed
+# between calls. The embedding model is not preloaded, so the first
+# RAG or memory write will also pay a one-time cold-load tax.
+
+# Step down from the q5 default to q4 — ~2.5 GB resident vs ~3.5 GB.
+# Quality drop is noticeable on tool-use and strict-format output; fine
+# for ask / sh / commit / diff. Swap to gemma4:e2b for the smallest
+# footprint if q4 tool-use stability isn't good enough either way.
+model = "gemma4:e4b-it-q4_K_M"
+
+# Evict immediately after each call instead of the 2-minute default.
+# Trades ~1–3s of TTFT for the weights disappearing from wired memory
+# between invocations.
+ollama_keep_alive = "0"
+
+# Shrink the KV-cache pre-allocation further. 8k still covers ask / sh /
+# commit comfortably and saves another few hundred MB on top of the 16k
+# default.
+context_window = 8192
+
+# Skip the startup probes that preload chat + embedding models. On a
+# memory-constrained box the preload only helps if you query within
+# seconds of launching the CLI; otherwise it just inflates wired memory.
+warm_start = false
+
+# Disable Redis-backed recursive memory entirely. This avoids loading
+# nomic-embed-text on every memory write/read. Re-enable per-profile if
+# you explicitly want conversation memory on this machine.
+memory_enabled = false
+
+# Turn off the extended-thinking pass. Thinking roughly doubles tokens
+# generated per query (reasoning + answer), which means more eval compute
+# and more time with the weights pinned in RAM.
+thinking_mode = false

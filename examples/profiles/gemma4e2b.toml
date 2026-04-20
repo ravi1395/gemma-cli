@@ -1,0 +1,19 @@
+# Gemma 4 E2B profile — A/B companion to the default gemma3:4b-it-q4_K_M.
+#
+# gemma --profile e2b ask "..."
+#
+# Use this when you want Gemma 4's extended thinking traces or you suspect
+# the 4-bit quantization in the default is degrading quality on your
+# prompts. Keeps the same memory-frugal posture as the low-memory profile
+# so the comparison is apples-to-apples on RAM footprint.
+
+model = "gemma4:e2b"
+
+# Match the default's memory discipline so any quality/speed difference
+# you observe is attributable to the model, not to keep_alive or warm-start.
+ollama_keep_alive = "2m"
+warm_start = false
+
+# Gemma 4 ships with extended thinking — leave it on so you can actually
+# see the reasoning traces this model was trained for.
+thinking_mode = true
