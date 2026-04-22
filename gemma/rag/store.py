@@ -221,28 +221,38 @@ class RedisVectorStore:
         Two clients are needed because a single client can't decode
         some responses and pass others through. We cache the binary
         client for the life of the store.
+
+        Important: we always build the binary client from the URL rather
+        than re-using the session-injected pool. redis-py 7.x ignores the
+        ``decode_responses=False`` kwarg when ``connection_pool`` is
+        supplied — it inherits the pool's own ``decode_responses`` setting
+        instead. A session pool built with ``decode_responses=True`` would
+        therefore silently produce a "binary" client that still decodes,
+        causing ``mget`` to raise ``UnicodeDecodeError`` on raw float32
+        embedding bytes and making ``load_all_embeddings`` return ``{}``.
+        Building fresh from the URL guarantees the correct setting.
         """
         if self._binary_client is None:
-            if self._client is not None and hasattr(self._client, "connection_pool"):
-                # Reuse the same pool when possible (real redis-py). For
-                # fakeredis, fall through to the else branch which
-                # assumes the fakeredis client can be used as-is with
-                # bytes by calling the ``*_byte`` flavoured methods we
-                # use explicitly below.
+            if redis is None:
+                raise RuntimeError("redis-py not installed. RAG requires the 'memory' extra.")
+            if self._redis_url:
+                # Always build from the URL so decode_responses=False is
+                # honoured regardless of any injected session pool.
+                self._binary_client = redis.Redis.from_url(
+                    self._redis_url, decode_responses=False,
+                )
+            elif self._client is not None:
+                # No URL available (test-injected client path). Attempt
+                # pool reuse and fall back to the client itself for fakeredis.
                 try:
                     self._binary_client = type(self._client)(
                         connection_pool=self._client.connection_pool,
                         decode_responses=False,
                     )
                 except TypeError:
-                    # fakeredis doesn't accept connection_pool kwarg.
                     self._binary_client = self._client
-            elif redis is None:
-                raise RuntimeError("redis-py not installed. RAG requires the 'memory' extra.")
             else:
-                self._binary_client = redis.Redis.from_url(
-                    self._redis_url, decode_responses=False,
-                )
+                raise RuntimeError("RedisVectorStore: no redis_url or client available.")
         return self._binary_client
 
     # ------------------------------------------------------------------

@@ -51,14 +51,43 @@ class Embedder:
         return np.asarray(vectors[0], dtype=np.float32)
 
     def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
-        """Embed a list of strings. Ollama's embed supports list input directly."""
+        """Embed a list of strings. Ollama's embed supports list input directly.
+
+        If the batch-level call fails with a context-length error (Ollama
+        returns 400 when any single item exceeds the model's token limit),
+        fall back to embedding each text individually so only the oversized
+        item is skipped rather than the whole batch.
+        """
         if not texts:
             return []
-        response = self._client.embed(
-            model=self._model, input=texts, keep_alive=self._keep_alive
-        )
-        vectors = response.get("embeddings") or []
-        return [np.asarray(v, dtype=np.float32) for v in vectors]
+        try:
+            response = self._client.embed(
+                model=self._model, input=texts, keep_alive=self._keep_alive
+            )
+            vectors = response.get("embeddings") or []
+            return [np.asarray(v, dtype=np.float32) for v in vectors]
+        except Exception as exc:
+            # On "input length exceeds context length" (status 400) retry
+            # item-by-item so only the offending chunk is lost, not the
+            # whole batch. Any other error is re-raised so the caller's
+            # existing error handling fires as before.
+            if "exceeds" not in str(exc).lower() and "context" not in str(exc).lower():
+                raise
+            results: list[np.ndarray] = []
+            for text in texts:
+                try:
+                    single = self._client.embed(
+                        model=self._model, input=text, keep_alive=self._keep_alive
+                    )
+                    vecs = single.get("embeddings") or []
+                    results.append(
+                        np.asarray(vecs[0], dtype=np.float32) if vecs else np.zeros(0, dtype=np.float32)
+                    )
+                except Exception:
+                    # Chunk is genuinely too long — return a zero vector so
+                    # the caller can detect and skip it (empty size check).
+                    results.append(np.zeros(0, dtype=np.float32))
+            return results
 
     def is_available(self) -> bool:
         """Probe with a tiny input to check the model is pulled and reachable."""

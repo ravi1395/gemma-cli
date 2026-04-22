@@ -286,7 +286,7 @@ gemma ask "<prompt>" [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model, -m` | `gemma3:4b-it-q4_K_M` | Override Ollama model |
+| `--model, -m` | `gemma4:e2b` | Override Ollama model |
 | `--system, -s` | config default | Override system prompt |
 | `--think` | off | Enable Gemma 4 extended step-by-step reasoning |
 | `--no-stream` | off | Collect full response, render as Markdown |
@@ -630,7 +630,7 @@ $ gemma tools audit
 
 ```toml
 # Model
-model = "gemma3:4b-it-q4_K_M"                  # default model
+model = "gemma4:e2b"                  # default model
 system_prompt = "You are a helpful assistant."
 temperature = 0.7
 ollama_host = "http://localhost:11434"
@@ -672,7 +672,7 @@ memory_top_k = 3
 
 **Fast mode** — `~/.config/gemma/profiles/fast.toml`
 ```toml
-model = "gemma3:4b-it-q4_K_M"
+model = "gemma4:e2b"
 ollama_keep_alive = "-1"   # pin model in RAM permanently
 memory_top_k = 2
 cache_enabled = true
@@ -711,7 +711,7 @@ Three mutually exclusive output modes designed for shell pipelines:
 $ gemma ask --json "list three sorting algorithms"
 {
   "content": "Quicksort, Mergesort, Heapsort...",
-  "model": "gemma3:4b-it-q4_K_M",
+  "model": "gemma4:e2b",
   "elapsed_ms": 1842,
   "cache_hit": false
 }

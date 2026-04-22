@@ -1,17 +1,20 @@
 # Low-memory profile — for machines where RAM is tight (<=16 GB) and
-# sustained Ollama residency + embedding-model preload cause swap pressure.
+# sustained Ollama residency causes swap pressure.
 #
-# gemma --profile low-memory ask "..."
+# gemma --profile low-memory ask --no-agent "..."
 #
-# Trade-off: expect ~1–3s of extra TTFT on the first query in a shell
-# session (weights must reload), in exchange for ~6–8 GB of RAM freed
-# between calls. The embedding model is not preloaded, so the first
-# RAG or memory write will also pay a one-time cold-load tax.
+# IMPORTANT: Gemma 3 (classic) does NOT support tool-calling in Ollama —
+# only Gemma 3n (the gemma4:* tags) does. That's the trade-off this profile
+# makes: you give up agent/tools in exchange for a ~3.3 GB resident
+# footprint instead of the default's ~9.6 GB. Pass --no-agent on every
+# invocation, or the server will return "does not support tools (400)".
+#
+# Good for: ask / sh / commit / diff / pipe (none of which need tools).
+# Not for: ask with tool-calling, code review that needs Read/Grep, memory
+# writes that trigger condensation plans.
 
-# Step down from the q5 default to q4 — ~2.5 GB resident vs ~3.5 GB.
-# Quality drop is noticeable on tool-use and strict-format output; fine
-# for ask / sh / commit / diff. Swap to gemma4:e2b for the smallest
-# footprint if q4 tool-use stability isn't good enough either way.
+# Gemma 3 4B at Q4 — ~3.3 GB resident. The only locally available model
+# that meaningfully reduces RAM vs. the Gemma 3n defaults (7–10 GB).
 model = "gemma3:4b-it-q4_K_M"
 
 # Evict immediately after each call instead of the 2-minute default.

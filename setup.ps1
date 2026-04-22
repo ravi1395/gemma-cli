@@ -6,7 +6,7 @@
 #   3. Installs gemma-cli with memory + dev extras into the venv
 #   4. Ensures Redis is running — installs via winget/chocolatey or falls back to
 #      Docker if already available
-#   5. Pulls gemma3:4b-it-q4_K_M and nomic-embed-text into Ollama (skipped per model if present)
+#   5. Pulls gemma4:e2b and nomic-embed-text into Ollama (skipped per model if present)
 #   6. Runs the test suite to confirm everything wired up correctly
 #
 # Usage:
@@ -292,7 +292,7 @@ if (Test-RedisRunning) {
 
 Step "Pulling Ollama models"
 
-$ChatModel = "gemma3:4b-it-q4_K_M"
+$ChatModel = "gemma4:e2b"
 $EmbedModel = "nomic-embed-text"
 
 function Pull-ModelIfMissing {

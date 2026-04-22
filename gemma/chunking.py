@@ -103,6 +103,21 @@ def chunk_for_path(source: str, path: str) -> List[Chunk]:
 # safety split so very long defs don't blow the embedder's token budget.
 _PY_LONG_DEF_THRESHOLD = 200
 
+# Markdown sections above this line count get the same sliding-window
+# treatment. nomic-embed-text has an 8192-token context window; at ~80
+# chars/line that's ~410 lines before truncation risk. 200 is a safe
+# margin that also keeps individual chunk sizes reasonable for retrieval.
+_MD_LONG_SECTION_THRESHOLD = 200
+
+# Hard character ceiling for any chunk sent to the embedding model.
+# nomic-embed-text uses a BERT/WordPiece tokenizer that encodes Python
+# source code at roughly 1 char/token (punctuation, operators, and
+# indentation spaces each become their own token). A 6000-char ceiling
+# keeps us comfortably below the 8192-token context limit even for the
+# most symbol-dense code, while still fitting several hundred lines of
+# typical prose or source into a single chunk.
+_MAX_EMBED_CHARS = 6000
+
 
 def chunk_python(source: str, path: str) -> List[Chunk]:
     """Chunk Python source by top-level ``def`` / ``class`` boundaries.
@@ -168,9 +183,11 @@ def chunk_python(source: str, path: str) -> List[Chunk]:
         header = _py_header(node)
         span = end - start + 1
 
-        if span > _PY_LONG_DEF_THRESHOLD:
+        if span > _PY_LONG_DEF_THRESHOLD or len(body_text) > _MAX_EMBED_CHARS:
             # Further split: reuse sliding window, but preserve the header
             # and offset line numbers so citations remain correct.
+            # Triggered by either line count OR character count exceeding
+            # the embedder's safe input ceiling.
             for sub in chunk_sliding(body_text, path, start_offset=start):
                 chunks.append(
                     _make_chunk(
@@ -280,15 +297,34 @@ def chunk_markdown(source: str, path: str) -> List[Chunk]:
         body = "\n".join(lines[start - 1 : end]).rstrip()
         if not body:
             continue
-        chunks.append(
-            _make_chunk(
-                path=path,
-                start_line=start,
-                end_line=end,
-                text=body,
-                header=heading,
+
+        span = end - start + 1
+        if span > _MD_LONG_SECTION_THRESHOLD or len(body) > _MAX_EMBED_CHARS:
+            # Section is too long for nomic-embed-text's context window —
+            # apply the same sliding-window sub-split used for long Python
+            # defs, preserving the heading as header so retrieval context
+            # is retained for every sub-chunk.
+            # Triggered by either line count OR character count.
+            for sub in chunk_sliding(body, path, start_offset=start):
+                chunks.append(
+                    _make_chunk(
+                        path=sub.path,
+                        start_line=sub.start_line,
+                        end_line=sub.end_line,
+                        text=sub.text,
+                        header=heading,
+                    )
+                )
+        else:
+            chunks.append(
+                _make_chunk(
+                    path=path,
+                    start_line=start,
+                    end_line=end,
+                    text=body,
+                    header=heading,
+                )
             )
-        )
 
     return chunks
 

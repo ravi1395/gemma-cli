@@ -36,7 +36,7 @@ class Config:
     """
 
     # --- Base CLI ---
-    model: str = "gemma3:4b-it-q4_K_M"
+    model: str = "gemma4:e2b"
     system_prompt: str = "You are a helpful assistant."
     temperature: float = 0.7
     # Ollama pre-allocates a KV cache sized to this value, independent of the

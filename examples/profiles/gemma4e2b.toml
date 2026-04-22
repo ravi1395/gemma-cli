@@ -1,4 +1,4 @@
-# Gemma 4 E2B profile — A/B companion to the default gemma3:4b-it-q4_K_M.
+# Gemma 4 E2B profile — A/B companion to the default gemma4:e4b-it-q4_K_M.
 #
 # gemma --profile e2b ask "..."
 #

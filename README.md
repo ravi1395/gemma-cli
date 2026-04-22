@@ -316,11 +316,13 @@ The models share unified memory on Apple Silicon with `nomic-embed-text` (~274 M
 
 | Model | Approx. size (Q4) | 16 GB Mac | 24 GB Mac | 32 GB+ Mac |
 |---|---|---|---|---|
-| `gemma3:4b-it-q4_K_M` | ~3–4 GB | Comfortable | Comfortable | Comfortable |
+| `gemma3:4b-it-q4_K_M` | ~3.3 GB | Comfortable (no tools) | Comfortable | Comfortable |
+| `gemma4:e2b` | ~7.2 GB | Tight but workable | Comfortable | Comfortable |
+| `gemma4:e2b` | ~9.6 GB | Tight — apply `keep_alive=2m` + `context_window=16384` | Comfortable | Comfortable |
 | `gemma4:12b` | ~8 GB | Tight — leaves ~7 GB for OS + nomic | Comfortable | Comfortable |
 | `gemma4:27b` | ~16 GB | Will page to swap — avoid | Marginal | Comfortable |
 
-**On a 16 GB machine:** E4B is the intended default. The 12B model is feasible with Ollama's default Q4 quantisation but leaves little headroom for other applications. The 27B model will cause memory pressure; response latency will degrade noticeably from swap usage.
+**On a 16 GB machine:** E4B (Gemma 3n) is the intended default because it's the smallest tool-calling model. If you don't need agent/tools, switch to `gemma3:4b-it-q4_K_M` via the `low-memory` profile — it's ~3× smaller but Gemma 3 (classic) does not support tool-calling in Ollama. The 12B and 27B models will cause memory pressure; response latency will degrade noticeably from swap usage.
 
 **On 24 GB+:** The 12B is the best practical upgrade — condensation quality improves substantially and the model still loads entirely in RAM alongside the embedding model. The 27B is usable on 32 GB machines.
 
@@ -352,7 +354,7 @@ chmod +x setup.sh
 4. Installs gemma-cli with all dependencies (`pip install -e ".[memory,dev]"`)
 5. Ensures Redis is running — installs natively (`brew install redis` on macOS, `apt-get`/`dnf` on Linux); falls back to Docker only if Docker is already available and a native install cannot be performed
 6. Installs Ollama if missing (`brew install ollama` on macOS, official install script on Linux)
-7. Pulls `gemma3:4b-it-q4_K_M` (~3–4 GB) and `nomic-embed-text` (~274 MB) into Ollama
+7. Pulls `gemma4:e2b` (~3–4 GB) and `nomic-embed-text` (~274 MB) into Ollama
 8. Runs the full test suite to confirm everything is wired up
 
 ```bash
@@ -382,7 +384,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 3. Installs gemma-cli with all dependencies
 4. Ensures Redis is running — installs via `winget`/Chocolatey or [Memurai](https://www.memurai.com/) (Redis-compatible for Windows); falls back to Docker if already available
 5. Installs Ollama if missing (via `winget` or `choco`)
-6. Pulls `gemma3:4b-it-q4_K_M` and `nomic-embed-text` into Ollama
+6. Pulls `gemma4:e2b` and `nomic-embed-text` into Ollama
 7. Runs the full test suite
 
 ```powershell
@@ -404,7 +406,7 @@ cd gemma-cli
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[memory]"
-ollama pull gemma3:4b-it-q4_K_M
+ollama pull gemma4:e2b
 ollama pull nomic-embed-text
 ```
 
@@ -415,7 +417,7 @@ cd gemma-cli
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e ".[memory]"
-ollama pull gemma3:4b-it-q4_K_M
+ollama pull gemma4:e2b
 ollama pull nomic-embed-text
 ```
 
@@ -580,7 +582,7 @@ gemma ask "What did we decide about the auth layer?" --keep-alive 2h
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model for this call |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model for this call |
 | `--system`, `-s` | (config default) | Override the system prompt |
 | `--no-stream` | off | Collect the full response, then render as Markdown |
 | `--no-memory` | off | Skip memory retrieval and recording |
@@ -620,14 +622,14 @@ Type `exit`, `quit`, or `:q` (or press `Ctrl-D`) to quit.
 The status line shows the current model and memory mode:
 
 ```
-gemma chat (gemma3:4b-it-q4_K_M, memory mode) -- type 'exit' or Ctrl-D to quit
+gemma chat (gemma4:e2b, memory mode) -- type 'exit' or Ctrl-D to quit
 ```
 
 Memory mode will show `degraded mode` if Redis is unreachable, and the CLI will still work using an in-memory fallback.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--system`, `-s` | (config default) | Override the system prompt |
 | `--fresh` | off | Clear the raw sliding window before starting (condensed memories are kept) |
 | `--no-memory` | off | Disable all memory features |
@@ -656,7 +658,7 @@ cat report.md | gemma pipe "Extract action items" --no-stream
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--no-stream` | off | Collect and render as Markdown instead of streaming |
 | `--json` | off | Emit a JSON object (`content`, `model`, `elapsed_ms`, `cache_hit`) |
 | `--only <field>` | — | Print a single JSON field naked (mutually exclusive with `--json`/`--code`) |
@@ -806,7 +808,7 @@ gemma ask --json "what model are you?" | jq '{model, elapsed_ms}'
 Output shape:
 
 ```json
-{"content": "...", "model": "gemma3:4b-it-q4_K_M", "elapsed_ms": 1842, "cache_hit": false}
+{"content": "...", "model": "gemma4:e2b", "elapsed_ms": 1842, "cache_hit": false}
 ```
 
 ### `--only <field>`
@@ -982,7 +984,7 @@ The command is generated at `temperature=0.2` to minimise hallucination. A small
 | `--no-exec` | off | Print the command only; never prompt to run |
 | `--shell` | `$SHELL` | Target shell syntax: `bash`, `zsh`, `sh` |
 | `--explain` | off | Prepend a `#` comment describing what the command does |
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
@@ -1018,7 +1020,7 @@ gemma explain --cmd "git rebase -i HEAD~5" --with-memory
 | `--lines`, `-n` | all (≤20 KB) | For file mode: read only the first N lines |
 | `--with-memory` | off | Retrieve relevant Redis context before answering |
 | `--no-stream` | off | Collect then render as Markdown |
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
@@ -1056,7 +1058,7 @@ Without `--apply` the message is printed for review and you can copy it manually
 |---|---|---|
 | `--apply` | off | Create the commit after generating the message |
 | `--type` | (model decides) | Force a conventional-commit type: `feat`, `fix`, `chore`, `docs`, … |
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--keep-alive` | `2m` | Ollama model-residency duration |
 
 > **Note:** if `commit.gpgsign = true` is set in your git config, `git commit` will invoke your signing key as normal. `gemma commit` does not bypass signing.
@@ -1094,7 +1096,7 @@ tests/test_auth.py — adds three unit tests covering the new JWT helper.
 |---|---|---|
 | `--staged` / `--cached` | off | Diff the staging area instead of the working tree |
 | `--overall` | off | One prose paragraph instead of per-file summaries |
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
@@ -1121,7 +1123,7 @@ gemma why --last-file /tmp/my_last_cmd
 | Flag | Default | Description |
 |---|---|---|
 | `--last-file` | `~/.gemma_last_cmd` | Path to the last-command record (also read from `$GEMMA_LAST_FILE`) |
-| `--model`, `-m` | `gemma3:4b-it-q4_K_M` | Override the Ollama model |
+| `--model`, `-m` | `gemma4:e2b` | Override the Ollama model |
 | `--keep-alive` | `2m` | Ollama model-residency duration |
 
 ---
@@ -1166,7 +1168,7 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 
 | Field | Default | Description |
 |---|---|---|
-| `model` | `gemma3:4b-it-q4_K_M` | Ollama model tag for chat and condensation |
+| `model` | `gemma4:e2b` | Ollama model tag for chat and condensation |
 | `system_prompt` | `"You are a helpful assistant."` | Default system message |
 | `temperature` | `0.7` | Sampling temperature for chat (condensation always uses 0.2) |
 | `context_window` | `16384` | Total token budget; 75% is used for input, 25% reserved for response |

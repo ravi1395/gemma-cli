@@ -37,7 +37,15 @@ def pool_for(cfg: Config) -> Optional[Any]:
     except ImportError:
         return None
     try:
-        return _redis.ConnectionPool.from_url(cfg.redis_url)
+        # decode_responses=True must be set on the pool itself, not just on
+        # the per-client Redis() constructor. redis-py 7.x ignores the
+        # decode_responses kwarg passed to Redis() when a connection_pool is
+        # supplied — it uses the pool's own setting instead. Without this,
+        # every text client built from the pool (memory, cache, RAG) would
+        # silently receive bytes where it expects str, causing key-construction
+        # bugs (e.g. b'chunk_id' interpolated into f-strings) and corrupted
+        # hgetall/smembers results.
+        return _redis.ConnectionPool.from_url(cfg.redis_url, decode_responses=True)
     except Exception:
         return None
 
