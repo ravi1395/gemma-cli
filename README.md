@@ -1277,7 +1277,8 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 | `ollama_host` | `http://localhost:11434` | Ollama server base URL (only used when `backend = "ollama"`) |
 | `memory_enabled` | `True` | Master switch; set `False` to disable all Redis/embedding features |
 | `thinking_mode` | `False` | Show extended-reasoning tokens (think channel) in the output. |
-| `ollama_keep_alive` | `"2m"` | How long the runtime keeps the model loaded in RAM between calls. Maps to LM Studio's TTL when `backend = "lmstudio"`. Accepts duration strings (`"2m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
+| `ollama_keep_alive` | `"2m"` | How long the runtime keeps the **chat** model loaded in RAM between calls. Maps to LM Studio's TTL when `backend = "lmstudio"`. Accepts duration strings (`"2m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
+| `embed_keep_alive` | `"30s"` | Per-model TTL override for the **embedding** model. Embeddings are written briefly during memory condensation and RAG indexing then idle for minutes — the shorter default lets the embedder unload between bursts, saving ~500 MB of resident RAM on 16 GB Macs. Bump to match `ollama_keep_alive` if you do bursty RAG indexing on a host with abundant RAM. |
 | `cache_enabled` | `True` | Master switch for the SHA-keyed response cache |
 | `cache_ttl_seconds` | `3600` | Cache entry TTL in seconds; `0` disables all caching |
 | `cache_temperature_max` | `0.3` | Skip caching for calls with temperature above this value |

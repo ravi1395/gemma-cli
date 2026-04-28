@@ -70,6 +70,14 @@ class Config:
     # named ``ollama_keep_alive`` for backwards-compatibility with
     # existing profiles.
     ollama_keep_alive: str = "2m"
+    # Per-model TTL override for the embedding model. Embeddings are
+    # written briefly during memory condensation and RAG indexing, then
+    # idle for minutes — keeping them resident under the same 2-minute
+    # ``ollama_keep_alive`` as the chat model wastes ~500 MB on
+    # 16 GB Macs. Default 30 s lets the embedder unload soon after each
+    # use; bump to match ``ollama_keep_alive`` if you do bursty RAG
+    # indexing on a host with abundant RAM.
+    embed_keep_alive: str = "30s"
     show_context_metrics: bool = True  # Print token-count footer after each response
 
     # --- Response cache ---

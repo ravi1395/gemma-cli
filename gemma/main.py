@@ -228,20 +228,28 @@ def _warm_embedder(cfg: Config) -> None:
 
 
 def _spawn_warm_start(cfg: Config) -> None:
-    """Spawn the two warm-up threads when the config allows.
+    """Spawn the warm-up threads when the config allows.
 
     Factored into its own function (rather than inlining in the callback)
     so tests can monkey-patch either this seam or the individual helpers
     without jumping through Typer.
+
+    The embed-model warm-up is **conditional on** ``cfg.memory_enabled``:
+    a plain ``gemma ask "..."`` with memory disabled never reads or
+    writes embeddings, so loading ``nomic-embed`` into the runtime
+    just to evict it 2 minutes later costs ~500 MB of RAM for nothing.
+    Users who want the embedder primed regardless of memory state can
+    flip ``memory_enabled = True`` in their profile (the default).
     """
     if not cfg.warm_start or cfg.in_test_mode:
         return
     threading.Thread(
         target=_warm_chat, args=(cfg,), daemon=True, name="gemma-warm-chat"
     ).start()
-    threading.Thread(
-        target=_warm_embedder, args=(cfg,), daemon=True, name="gemma-warm-embed"
-    ).start()
+    if cfg.memory_enabled:
+        threading.Thread(
+            target=_warm_embedder, args=(cfg,), daemon=True, name="gemma-warm-embed"
+        ).start()
 
 
 # Backwards-compat alias — older tests reach into ``_warm_ollama`` by name.

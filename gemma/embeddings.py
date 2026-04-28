@@ -76,7 +76,9 @@ class Embedder:
         store or skip it. Errors propagate up; the memory pipeline
         catches and degrades to importance-based retrieval.
         """
-        return self._backend.embed(text, model=self._model)
+        # Forward the held config so the backend can read TTL knobs
+        # (e.g. ``embed_keep_alive`` on the LM Studio path).
+        return self._backend.embed(text, model=self._model, config=self._config)
 
     def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
         """Embed a list of strings.
@@ -84,7 +86,9 @@ class Embedder:
         Backends fall back to per-item embedding on context-length
         errors so a single oversized chunk is the only one lost.
         """
-        return self._backend.embed_batch(texts, model=self._model)
+        return self._backend.embed_batch(
+            texts, model=self._model, config=self._config
+        )
 
     def is_available(self) -> bool:
         """Probe with a tiny input to check the model is loaded and reachable."""
