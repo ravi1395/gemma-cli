@@ -528,8 +528,11 @@ class RedisVectorStore:
         if not embeds:
             return [], {}
 
-        cids = list(embeds.keys())
-        matrix = np.stack([embeds[c] for c in cids], axis=0)  # (N, D)
+        # Stack values directly — dict iteration order is preserved in
+        # Python 3.7+, so ``cids[i]`` aligns with ``matrix[i]`` without
+        # paying for a second hash lookup per chunk.
+        cids = list(embeds)
+        matrix = np.stack(list(embeds.values()), axis=0)  # (N, D)
         # Dot product against pre-normalised vectors. Cheap and exact.
         scores = matrix @ q
 

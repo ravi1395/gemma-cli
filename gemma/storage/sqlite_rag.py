@@ -288,8 +288,10 @@ class SQLiteRAGStore:
         if not embeds:
             return [], {}
 
-        cids = list(embeds.keys())
-        matrix = np.stack([embeds[c] for c in cids], axis=0)
+        # Stack values directly; dict iteration order is preserved so
+        # ``cids[i]`` aligns with ``matrix[i]`` without per-key hashing.
+        cids = list(embeds)
+        matrix = np.stack(list(embeds.values()), axis=0)
         scores = matrix @ q
 
         if k >= len(cids):

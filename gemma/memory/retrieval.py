@@ -122,8 +122,12 @@ class MemoryRetriever:
         if not embeddings:
             return []
 
-        ids = list(embeddings.keys())
-        matrix = np.stack([embeddings[mid] for mid in ids])
+        # Stack the values directly (dict iteration order is preserved
+        # in Python 3.7+) instead of round-tripping every key through a
+        # second dict lookup. ``ids`` is still needed below to map an
+        # argsort index back to a memory id.
+        ids = list(embeddings)
+        matrix = np.stack(list(embeddings.values()))
         sims = self._cosine_similarity_batch(query_vec, matrix)
 
         # Rank and filter

@@ -21,11 +21,12 @@ The recommended path is to pass either an explicit ``backend`` or a
 
 from __future__ import annotations
 
-from typing import Optional
-
-import numpy as np
+from typing import TYPE_CHECKING, Optional
 
 from gemma.backends import LLMBackend, get_backend
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class Embedder:
