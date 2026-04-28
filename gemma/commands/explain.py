@@ -30,7 +30,11 @@ from rich.markdown import Markdown
 from gemma.cache import build_cache
 from gemma.client import chat as client_chat
 from gemma.config import Config
-from gemma.memory import MemoryManager
+
+# ``MemoryManager`` is imported inside the function body so the
+# explain command stays cheap to load: with-memory is opt-in
+# (``--with-memory``) and most invocations skip it. Hoisting the
+# import here would drag numpy in for every ``gemma --help``.
 
 
 console = Console()
@@ -152,6 +156,8 @@ def explain_command(
 
     if with_memory:
         # Use the full memory-augmented context path.
+        from gemma.memory import MemoryManager
+
         mgr = MemoryManager(cfg)
         mgr.initialize()
         if mgr.degraded and cfg.memory_enabled:
