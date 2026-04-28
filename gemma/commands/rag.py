@@ -22,15 +22,22 @@ from rich.console import Console
 from rich.table import Table
 
 from gemma.config import Config
-from gemma.embeddings import Embedder
-from gemma.rag import (
-    RAGIndexer,
-    RAGRetriever,
-    RedisVectorStore,
-    resolve_namespace,
-)
+
+# ``Embedder`` and the ``RAGIndexer`` / ``RAGRetriever`` classes are
+# imported inside the function bodies that use them. Hoisting them here
+# would drag NumPy and the embedding stack into the import chain for
+# every CLI startup — even ``gemma --help`` invocations that never
+# touch RAG would pay ~30 MB of resident memory for nothing. The
+# ``gemma.rag`` package now exposes its public surface via PEP 562
+# lazy attributes, so the cost is paid only when a name is reached.
 
 if TYPE_CHECKING:
+    from gemma.embeddings import Embedder
+    from gemma.rag import (
+        RAGIndexer,
+        RAGRetriever,
+        RedisVectorStore,
+    )
     from gemma.session import GemmaSession
 
 
@@ -66,6 +73,8 @@ def _default_store_factory(namespace: str, redis_url: str) -> Any:
 
 
 def _default_embedder_factory(cfg: Config) -> Any:
+    from gemma.embeddings import Embedder
+
     return Embedder(model=cfg.embedding_model, host=cfg.ollama_host)
 
 
@@ -106,6 +115,8 @@ def _wire(
     embedder factory is still honoured — tests override it to inject stub
     embedders without needing a real Ollama server.
     """
+    from gemma.rag import resolve_namespace
+
     cfg = cfg or (session._cfg if session is not None else Config())
     # Memoised branch detection avoids re-forking ``git rev-parse`` on
     # every rag subcommand within the same session (#8).
@@ -149,6 +160,7 @@ def index_command(
     The first call embeds every matching file; subsequent calls re-embed
     only files whose content changed (by mtime+size+sha1).
     """
+    from gemma.rag import RAGIndexer
     from gemma.session import GemmaSession
 
     root = (path or Path.cwd()).resolve()
@@ -204,6 +216,7 @@ def query_command(
     ),
 ) -> None:
     """Search the indexed workspace for chunks relevant to ``question``."""
+    from gemma.rag import RAGRetriever
     from gemma.session import GemmaSession
 
     root = (path or Path.cwd()).resolve()

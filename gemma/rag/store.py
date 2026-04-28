@@ -128,12 +128,16 @@ class StoreSnapshot:
     chunk_count: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class StoredChunk:
     """A chunk as it comes back from the store.
 
     Mirrors :class:`gemma.chunking.Chunk` but with an additional
     ``score`` field populated by :meth:`RedisVectorStore.search`.
+
+    ``slots=True`` removes the per-instance ``__dict__`` (~56 B). With
+    typical RAG indexes holding 5k-50k chunks, this is a low-MB win
+    that scales linearly with corpus size.
     """
 
     id: str

@@ -41,9 +41,14 @@ class MemoryCategory(str, Enum):
         return cls.FACTUAL_CONTEXT
 
 
-@dataclass
+@dataclass(slots=True)
 class ConversationTurn:
-    """A single user or assistant turn in the sliding window."""
+    """A single user or assistant turn in the sliding window.
+
+    ``slots=True`` removes the per-instance ``__dict__`` (~56 B saved
+    per turn) and catches typo'd attribute writes. Cheap win because
+    every chat session holds a sliding window of these.
+    """
 
     role: str                    # "user" | "assistant" | "system"
     content: str
@@ -55,13 +60,17 @@ class ConversationTurn:
         return {"role": self.role, "content": self.content}
 
 
-@dataclass
+@dataclass(slots=True)
 class MemoryRecord:
     """A single condensed memory persisted in Redis.
 
     Fields map 1:1 to the Redis hash at `gemma:memory:{memory_id}`. All
     values are stringified by `to_redis_hash()` because Redis hashes are
     flat string->string maps.
+
+    ``slots=True`` saves ~56 B of ``__dict__`` overhead per instance.
+    A 10k-memory store saves ~0.5 MB; large corpora save proportionally
+    more.
     """
 
     content: str

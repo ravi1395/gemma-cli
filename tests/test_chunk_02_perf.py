@@ -6,6 +6,8 @@ Each item gets one focused test. Benchmarks still live in
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
+
 import numpy as np
 import fakeredis
 import pytest
@@ -141,8 +143,9 @@ def test_mmr_vectorised_matches_legacy(seed):
     lam = float(rng.uniform(0.1, 0.9))
 
     # Fresh StoredChunk copies so the two runs don't share mutable score state.
-    a_chunks = [StoredChunk(**c.__dict__) for c in chunks]
-    b_chunks = [StoredChunk(**c.__dict__) for c in chunks]
+    # ``replace()`` works whether or not the dataclass has ``slots=True``.
+    a_chunks = [dc_replace(c) for c in chunks]
+    b_chunks = [dc_replace(c) for c in chunks]
 
     legacy = _legacy_mmr(candidates=a_chunks, embed_map=embed_map, query_vec=q, k=k, lam=lam)
     new = _mmr(candidates=b_chunks, embed_map=embed_map, query_vec=q, k=k, lam=lam)

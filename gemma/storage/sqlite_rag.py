@@ -52,6 +52,12 @@ class SQLiteRAGStore:
         _ = pool
         self._namespace = namespace
         self._conn = open_db(config)
+        # Snapshot the cache cap once — config is otherwise stateless
+        # for this store, so we don't need to keep a reference to it.
+        # ``0`` (or negative) disables the cap.
+        self._embed_cache_max = max(0, int(getattr(
+            config, "embed_cache_max_entries", 0,
+        )))
 
     # ------------------------------------------------------------------
     # Connection / metadata
@@ -130,11 +136,14 @@ class SQLiteRAGStore:
     # ------------------------------------------------------------------
 
     def load_manifest_hash(self) -> Dict[str, str]:
-        rows = self._conn.execute(
+        # Stream the cursor — for a 10k-file manifest this avoids
+        # holding the ``rows`` list and the resulting dict in memory at
+        # the same time.
+        cursor = self._conn.execute(
             "SELECT path, blob_sha FROM rag_manifest WHERE namespace = ?",
             (self._namespace,),
-        ).fetchall()
-        return {r["path"]: r["blob_sha"] for r in rows}
+        )
+        return {r["path"]: r["blob_sha"] for r in cursor}
 
     def save_manifest_hash(self, blobs: Dict[str, str]) -> None:
         """Replace the manifest atomically: delete-all then insert-batch."""
@@ -203,11 +212,11 @@ class SQLiteRAGStore:
         return int(row["c"]) if row else 0
 
     def all_chunk_ids(self) -> List[str]:
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             "SELECT chunk_id FROM rag_chunks WHERE namespace = ?",
             (self._namespace,),
-        ).fetchall()
-        return [r["chunk_id"] for r in rows]
+        )
+        return [r["chunk_id"] for r in cursor]
 
     def get_chunk(self, chunk_id: str) -> Optional[StoredChunk]:
         row = self._conn.execute(
@@ -226,15 +235,15 @@ class SQLiteRAGStore:
         if not chunk_ids:
             return []
         placeholders = ",".join("?" * len(chunk_ids))
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             f"""
             SELECT chunk_id, path, start_line, end_line, text, header
               FROM rag_chunks
              WHERE namespace = ? AND chunk_id IN ({placeholders})
             """,
             (self._namespace, *chunk_ids),
-        ).fetchall()
-        by_id = {r["chunk_id"]: self._row_to_chunk(r) for r in rows}
+        )
+        by_id = {r["chunk_id"]: self._row_to_chunk(r) for r in cursor}
         # Preserve caller order; ``None`` for missing IDs (matches Redis path).
         return [by_id.get(cid) for cid in chunk_ids]
 
@@ -251,16 +260,20 @@ class SQLiteRAGStore:
         return np.frombuffer(row["vector"], dtype=np.float32)
 
     def load_all_embeddings(self) -> Dict[str, np.ndarray]:
-        """Single SELECT vs Redis's MGET; same shape returned."""
-        rows = self._conn.execute(
+        """Single SELECT vs Redis's MGET; same shape returned.
+
+        For an index of 10k+ chunks this avoids holding the raw row
+        list and the parsed-vector dict in memory simultaneously.
+        """
+        cursor = self._conn.execute(
             """
             SELECT chunk_id, vector FROM rag_embeddings WHERE namespace = ?
             """,
             (self._namespace,),
-        ).fetchall()
+        )
         return {
             r["chunk_id"]: np.frombuffer(r["vector"], dtype=np.float32)
-            for r in rows
+            for r in cursor
         }
 
     # ------------------------------------------------------------------
@@ -323,7 +336,7 @@ class SQLiteRAGStore:
             return []
         sweep_expired(self._conn)
         placeholders = ",".join("?" * len(hashes))
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             f"""
             SELECT content_hash, vector
               FROM embed_cache
@@ -331,10 +344,10 @@ class SQLiteRAGStore:
                AND expires_at > ?
             """,
             (model, *hashes, time.time()),
-        ).fetchall()
+        )
         by_hash = {
             r["content_hash"]: np.frombuffer(r["vector"], dtype=np.float32)
-            for r in rows
+            for r in cursor
         }
         return [by_hash.get(h) for h in hashes]
 
@@ -372,7 +385,48 @@ class SQLiteRAGStore:
             """,
             rows,
         )
+        # FIFO eviction: if this batch pushed total cached entries past
+        # the configured cap, drop the oldest (smallest ``expires_at``,
+        # which monotonically tracks insertion time at a fixed TTL).
+        # Done *after* the insert so a single huge batch is allowed to
+        # land before being trimmed back down to the cap.
+        self._enforce_embed_cache_cap()
         self._conn.commit()
+
+    def _enforce_embed_cache_cap(self) -> None:
+        """Trim the embed cache back to ``embed_cache_max_entries``.
+
+        No-op when the cap is disabled (``0``) or the table is already
+        within budget. Eviction is FIFO via ``expires_at`` — that field
+        is monotonic across writes at a fixed TTL, so it doubles as an
+        insertion-order proxy without needing a separate timestamp
+        column.
+        """
+        cap = self._embed_cache_max
+        if cap <= 0:
+            return
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM embed_cache"
+        ).fetchone()
+        total = int(row["c"]) if row else 0
+        excess = total - cap
+        if excess <= 0:
+            return
+        # SQLite supports DELETE with ORDER BY + LIMIT only when built
+        # with ``SQLITE_ENABLE_UPDATE_DELETE_LIMIT``; the rowid-IN form
+        # is portable and uses the existing ``idx_embed_cache_expires``
+        # index for the inner SELECT.
+        self._conn.execute(
+            """
+            DELETE FROM embed_cache
+             WHERE rowid IN (
+               SELECT rowid FROM embed_cache
+                ORDER BY expires_at ASC
+                LIMIT ?
+             )
+            """,
+            (excess,),
+        )
 
     def embed_cache_stats(
         self, model: Optional[str] = None,

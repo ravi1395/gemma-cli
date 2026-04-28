@@ -15,7 +15,12 @@ from rich.console import Console
 from rich.table import Table
 
 from gemma.config import Config
-from gemma.memory import MemoryManager
+
+# ``MemoryCategory`` / ``MemoryRecord`` are imported from the leaf
+# ``gemma.memory.models`` module so the parent package's lazy
+# __getattr__ doesn't pull manager/retrieval/store (and numpy) at
+# module load. ``MemoryManager`` is heavier (it transitively imports
+# numpy) and is fetched inside each command body below.
 from gemma.memory.models import MemoryCategory, MemoryRecord
 
 _console = Console()
@@ -72,6 +77,8 @@ def remember_command(
     # Resolve category: shortcut first, then lenient full-value parse.
     mem_cat = _CATEGORY_SHORTCUTS.get(category) or MemoryCategory.parse(category)
 
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     ok = mgr.initialize()
@@ -123,6 +130,8 @@ def forget_command(
         gemma forget --last
         gemma forget --match "staging Redis URL" --force
     """
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     ok = mgr.initialize()
@@ -203,6 +212,8 @@ def pin_command(
         gemma pin abc123
         gemma pin --match "JWT deadline"
     """
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     ok = mgr.initialize()
@@ -257,6 +268,8 @@ def context_command(
         gemma context "auth rewrite JWT"
         gemma context "what did we decide about Redis?"
     """
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     ok = mgr.initialize()

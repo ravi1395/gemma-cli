@@ -86,9 +86,14 @@ from gemma.commands.tools import (
 from gemma.completion import profile_completer
 from gemma.config import Config
 from gemma.history import SessionHistory
-from gemma.memory import MemoryManager
 from gemma.output import OutputMode, display_context_metrics, render_response
 from gemma.session import GemmaSession
+
+# ``MemoryManager`` is *not* imported here on purpose — pulling it in
+# transitively drags numpy (~30 MB resident) via gemma.memory.retrieval,
+# even for invocations like ``gemma --help`` that never touch memory.
+# Each call site below imports it locally so the cold-start path stays
+# light. See PR notes for the wider import-chain audit.
 
 
 app = typer.Typer(
@@ -1102,6 +1107,8 @@ def history_show() -> None:
 @history_app.command("clear")
 def history_clear() -> None:
     """Wipe both the JSON fallback history and the current-session sliding window."""
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     SessionHistory(cfg).clear()
     mgr = MemoryManager(cfg)
@@ -1115,6 +1122,8 @@ def history_memories(
     limit: int = typer.Option(50, "--limit", "-n", help="Max number of memories to show."),
 ) -> None:
     """List condensed memories stored in Redis, sorted by importance."""
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     mgr.initialize()
@@ -1140,6 +1149,8 @@ def history_memories(
 @history_app.command("stats")
 def history_stats() -> None:
     """Print memory-system statistics."""
+    from gemma.memory import MemoryManager
+
     cfg = Config()
     mgr = MemoryManager(cfg)
     mgr.initialize()

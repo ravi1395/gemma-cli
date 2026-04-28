@@ -31,9 +31,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileEntry:
     """One row of the manifest — metadata for a single indexed file.
+
+    ``slots=True`` is layered on top of ``frozen=True`` (Python 3.10+):
+    drops the per-instance ``__dict__`` (~56 B) which compounds for
+    manifests holding 5k-50k entries.
 
     Attributes:
         path:       Path relative to the workspace root, POSIX form.

@@ -190,14 +190,17 @@ class SQLiteMemoryStore:
 
     def get_all_active_memories(self) -> list[MemoryRecord]:
         sweep_expired(self._conn)
-        rows = self._conn.execute(
+        # Iterate the cursor directly so the rowset isn't materialised
+        # twice (once by ``fetchall`` then again by the comprehension).
+        # Peak memory during the call drops from 2N to N records.
+        cursor = self._conn.execute(
             """
             SELECT * FROM memories
              WHERE superseded_by = ''
              ORDER BY importance DESC, last_accessed DESC
             """
-        ).fetchall()
-        return [self._row_to_record(r) for r in rows]
+        )
+        return [self._row_to_record(r) for r in cursor]
 
     def get_top_memories(self, n: int = 20) -> list[MemoryRecord]:
         sweep_expired(self._conn)
@@ -251,19 +254,21 @@ class SQLiteMemoryStore:
         """Return ``{memory_id: vector}`` for every active memory.
 
         One JOIN against the active-memory predicate keeps the round-trip
-        count to one regardless of memory count.
+        count to one regardless of memory count. The cursor is iterated
+        directly so we don't hold both the BLOB rowset and the parsed
+        ``np.ndarray`` dict in memory at the same time.
         """
         sweep_expired(self._conn)
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             """
             SELECT m.memory_id AS mid, e.vector AS vec
               FROM memories m
               JOIN memory_embeddings e ON e.memory_id = m.memory_id
              WHERE m.superseded_by = ''
             """
-        ).fetchall()
+        )
         out: dict[str, np.ndarray] = {}
-        for r in rows:
+        for r in cursor:
             vec = np.frombuffer(r["vec"], dtype=np.float32)
             if vec.size > 0:
                 out[r["mid"]] = vec

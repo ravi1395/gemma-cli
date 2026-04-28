@@ -156,6 +156,15 @@ class Config:
     # accumulating forever while comfortably covering a sprint's worth
     # of reindex cycles on the same content.
     embed_cache_ttl_days: int = 30
+    # Hard ceiling on cached embed-vector entries (per-store). When a
+    # write would push the total above this, the oldest entries (by
+    # ``expires_at``) are evicted first. Default of 100k vectors at
+    # ~3 KB each ≈ 300 MB of disk; users with bursty re-indexes against
+    # shifting content can otherwise grow the cache for weeks before
+    # the 30-day TTL alone reclaims space. ``0`` disables the cap.
+    # Currently enforced in the SQLite backend; Redis users should
+    # configure ``maxmemory`` + ``allkeys-lru`` server-side.
+    embed_cache_max_entries: int = 100_000
 
     # --- Storage backend ---
     # ``sqlite`` (default) keeps memories, RAG vectors, and the response
