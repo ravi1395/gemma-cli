@@ -55,6 +55,12 @@ from gemma.commands.memory import (
     pin_command,
     remember_command,
 )
+from gemma.commands.model import (
+    info_command as model_info_command,
+    list_command as model_list_command,
+    pull_command as model_pull_command,
+    use_command as model_use_command,
+)
 from gemma.commands.shell import (
     install_shell_command,
     sh_command,
@@ -81,7 +87,12 @@ from gemma.output import OutputMode, display_context_metrics, render_response
 from gemma.session import GemmaSession
 
 
-app = typer.Typer(help="Local CLI for Google's Gemma 4 model via Ollama.")
+app = typer.Typer(
+    help=(
+        "Local CLI for Google's Gemma 4 model via LM Studio "
+        "(Ollama backend optional, --backend ollama)."
+    )
+)
 history_app = typer.Typer(help="Manage history, memories, and stats.")
 app.add_typer(history_app, name="history")
 
@@ -128,6 +139,16 @@ rag_app.add_typer(rag_cache_app, name="cache")
 
 app.add_typer(rag_app, name="rag")
 
+# Model management — pull/list/use/info. Lives at the top level so the
+# common workflow ``gemma model pull <hf-repo>`` matches what users
+# already type in shell history.
+model_app = typer.Typer(help="Manage chat/embedding models (LM Studio).")
+model_app.command("pull")(model_pull_command)
+model_app.command("list")(model_list_command)
+model_app.command("use")(model_use_command)
+model_app.command("info")(model_info_command)
+app.add_typer(model_app, name="model")
+
 # Active profile set by --profile flag in the top-level callback.
 # None means "use Config dataclass defaults".
 _active_profile: Optional[Config] = None
@@ -160,27 +181,22 @@ console = Console()
 # the warm-up is a no-op and the foreground command owns the error
 # surface (much clearer than a warm-up stacktrace pointing at nothing).
 
-def _warm_ollama(cfg: Config) -> None:
+def _warm_chat(cfg: Config) -> None:
     """Best-effort warm-up of the chat model. Never raises into the foreground.
 
-    Uses ``num_predict=1`` so Ollama loads the weights and returns
-    immediately — we don't care about the token, only the side effect of
-    bringing the model resident. ``keep_alive`` mirrors the runtime config
-    so the eviction timer resets for the subsequent real request.
+    Delegates to the active backend's ``warm_chat`` so the same
+    invocation works whether ``cfg.backend`` is ``lmstudio`` or
+    ``ollama``. ``keep_alive`` / TTL mirrors the runtime config so the
+    eviction timer resets for the subsequent real request.
     """
     try:
-        import ollama
+        from gemma.backends import get_backend
 
-        ollama.Client(host=cfg.ollama_host).chat(
-            model=cfg.model,
-            messages=[{"role": "user", "content": "_"}],
-            keep_alive=cfg.ollama_keep_alive,
-            options={"num_predict": 1, "temperature": 0.0},
-        )
+        get_backend(cfg).warm_chat(cfg)
     except Exception:
         # Intentional: warm-up is fire-and-forget. Logging here would
-        # produce noise for users without Ollama running who never ask
-        # for RAG/chat features.
+        # produce noise for users without the runtime running who never
+        # ask for RAG/chat features.
         pass
 
 
@@ -194,12 +210,9 @@ def _warm_embedder(cfg: Config) -> None:
     request.
     """
     try:
-        import ollama
+        from gemma.backends import get_backend
 
-        ollama.Client(host=cfg.ollama_host).embed(
-            model=cfg.embedding_model,
-            input=" ",
-        )
+        get_backend(cfg).warm_embed(cfg)
     except Exception:
         pass
 
@@ -214,11 +227,15 @@ def _spawn_warm_start(cfg: Config) -> None:
     if not cfg.warm_start or cfg.in_test_mode:
         return
     threading.Thread(
-        target=_warm_ollama, args=(cfg,), daemon=True, name="gemma-warm-chat"
+        target=_warm_chat, args=(cfg,), daemon=True, name="gemma-warm-chat"
     ).start()
     threading.Thread(
         target=_warm_embedder, args=(cfg,), daemon=True, name="gemma-warm-embed"
     ).start()
+
+
+# Backwards-compat alias — older tests reach into ``_warm_ollama`` by name.
+_warm_ollama = _warm_chat
 
 
 # -----------------------------------------------------------------------------
@@ -244,13 +261,23 @@ def main_callback(
         None,
         "--warm/--no-warm",
         help=(
-            "Warm Ollama's chat and embedding models in the background at "
-            "startup. On by default; pass --no-warm for scripted invocations "
-            "(e.g. 'gemma --no-warm history stats') that will never call Ollama."
+            "Warm the chat and embedding models in the background at "
+            "startup (LM Studio or Ollama, whichever is configured). "
+            "On by default; pass --no-warm for scripted invocations "
+            "(e.g. 'gemma --no-warm history stats') that will never "
+            "call the model."
+        ),
+    ),
+    backend: Optional[str] = typer.Option(
+        None,
+        "--backend",
+        help=(
+            "Override the LLM backend for this invocation. "
+            "One of 'lmstudio' (default) or 'ollama'."
         ),
     ),
 ) -> None:
-    """gemma – local Gemma 4 CLI via Ollama."""
+    """gemma — local Gemma 4 CLI via LM Studio (Ollama optional)."""
     global _active_profile
     if profile:
         try:
@@ -266,6 +293,11 @@ def main_callback(
     cfg = dataclasses.replace(_active_profile) if _active_profile is not None else Config()
     if warm is not None:
         cfg = dataclasses.replace(cfg, warm_start=warm)
+    if backend is not None:
+        cfg = dataclasses.replace(cfg, backend=backend.lower())
+        # Keep the resolved override visible to subcommands so they pick
+        # up ``--backend ollama`` even when no profile was loaded.
+        _active_profile = cfg
     _spawn_warm_start(cfg)
 
 
@@ -830,8 +862,6 @@ def ask(
 
         # --- Agent loop path ---
         if agent:
-            import ollama as _ollama
-
             # Register built-in tools and build the dispatcher.
             import gemma.tools.builtins  # noqa: F401 — triggers @tool decorators
             from gemma.tools.capabilities import GatingContext
@@ -859,7 +889,18 @@ def ask(
                     s for s in tool_schemas
                     if s.get("function", {}).get("name") != "plan"
                 ]
-            ollama_client = _ollama.Client(host=cfg.ollama_host)
+            # Pick the chat client the agent loop will call:
+            #   * Ollama backend → real ``ollama.Client`` (full tool-use support)
+            #   * LM Studio backend → ``OllamaShapeAdapter`` (chat works,
+            #     tool dispatch is a known follow-up — see ollama_compat.py)
+            if cfg.backend == "ollama":
+                import ollama as _ollama
+
+                ollama_client = _ollama.Client(host=cfg.ollama_host)
+            else:
+                from gemma.backends.ollama_compat import OllamaShapeAdapter
+
+                ollama_client = OllamaShapeAdapter(cfg)
 
             session_cache = None
             if cfg.agent_tool_cache:

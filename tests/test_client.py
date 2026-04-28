@@ -1,6 +1,10 @@
-"""Unit tests for the Ollama client wrapper.
+"""Unit tests for the chat client shim against the Ollama backend.
 
-Mocks `ollama.Client.chat` so tests run without a running Ollama server.
+The tests in this file exercise the legacy Ollama path: they pin
+``Config.backend = "ollama"`` and patch ``ollama.Client`` (re-exported
+by :mod:`gemma.backends.ollama_backend`) so the suite never reaches a
+real daemon. The complementary LM Studio coverage lives in
+``test_backend_lmstudio.py``.
 """
 
 from unittest.mock import MagicMock, patch
@@ -13,7 +17,9 @@ from gemma.config import Config
 
 @pytest.fixture
 def config() -> Config:
-    return Config()
+    # ``backend="ollama"`` routes the client shim through ``OllamaBackend``,
+    # which is the only backend whose call shape these tests assert.
+    return Config(backend="ollama")
 
 
 def _fake_stream(texts: list[str]):
@@ -39,7 +45,7 @@ def _fake_blocking_with_thinking(thinking: str, text: str) -> dict:
     return {"message": {"content": text, "thinking": thinking}}
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_ask_streams_tokens(mock_client_cls, config):
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_stream(["Hello ", "world"])
@@ -58,7 +64,7 @@ def test_ask_streams_tokens(mock_client_cls, config):
     assert call_kwargs["messages"][1]["content"] == "hi"
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_ask_blocking_returns_full_text(mock_client_cls, config):
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_blocking("done")
@@ -70,7 +76,7 @@ def test_ask_blocking_returns_full_text(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["stream"] is False
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_ask_respects_custom_system_prompt(mock_client_cls, config):
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_stream(["ok"])
@@ -82,7 +88,7 @@ def test_ask_respects_custom_system_prompt(mock_client_cls, config):
     assert messages[0]["content"] == "You are a pirate."
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_chat_passes_messages_through(mock_client_cls, config):
     mock_inst = MagicMock()
     mock_inst.chat.return_value = _fake_stream(["reply"])
@@ -100,7 +106,7 @@ def test_chat_passes_messages_through(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["messages"] == msgs
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_thinking_mode_streaming(mock_client_cls, config):
     """Thinking chunks are yielded as ("think", ...) before ("content", ...) tuples."""
     config.thinking_mode = True
@@ -118,7 +124,7 @@ def test_thinking_mode_streaming(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["think"] is True
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_thinking_mode_blocking(mock_client_cls, config):
     """Non-streaming thinking response yields think tuple then content tuple."""
     config.thinking_mode = True
@@ -132,7 +138,7 @@ def test_thinking_mode_blocking(mock_client_cls, config):
     assert tuples[1] == ("content", "final answer")
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_thinking_mode_off_by_default(mock_client_cls, config):
     """think=False is passed to Ollama when thinking_mode is off (the default)."""
     mock_inst = MagicMock()
@@ -144,7 +150,7 @@ def test_thinking_mode_off_by_default(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["think"] is False
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_thinking_mode_can_be_enabled(mock_client_cls, config):
     """think=True is passed to Ollama when thinking_mode is explicitly set to True."""
     config.thinking_mode = True
@@ -157,7 +163,7 @@ def test_thinking_mode_can_be_enabled(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["think"] is True
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_keep_alive_propagated(mock_client_cls, config):
     """The configured ollama_keep_alive is forwarded to ollama.Client.chat."""
     config.ollama_keep_alive = "2h"
@@ -170,7 +176,7 @@ def test_keep_alive_propagated(mock_client_cls, config):
     assert mock_inst.chat.call_args.kwargs["keep_alive"] == "2h"
 
 
-@patch("gemma.client.ollama.Client")
+@patch("gemma.backends.ollama_backend.ollama.Client")
 def test_metrics_chunk_yielded_at_end_of_stream(mock_client_cls, config):
     """A ('metrics', json_str) tuple is yielded after the last content chunk."""
     import json as _json
