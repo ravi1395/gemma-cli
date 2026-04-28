@@ -19,8 +19,6 @@ import json
 import re
 from typing import Any, Optional
 
-import ollama
-
 from gemma.config import Config
 from gemma.memory.models import (
     ConversationTurn,
@@ -80,8 +78,20 @@ class CondensationPipeline:
     """Turn conversation turns into structured MemoryRecords via Gemma."""
 
     def __init__(self, config: Config, client: Optional[Any] = None):
+        """Build a pipeline.
+
+        Args:
+            config: Runtime configuration; the active backend is
+                resolved from ``config.backend`` when ``client`` is
+                None (the production path).
+            client: Test/DI hook accepting an Ollama-shape duck type
+                (``client.chat(model=..., messages=..., stream=False,
+                options=...)`` returning ``{"message": {"content":
+                str}}``). Production code passes None and routes
+                through :mod:`gemma.client`.
+        """
         self._config = config
-        self._client = client or ollama.Client(host=config.ollama_host)
+        self._client = client
 
     # ------------------------------------------------------------------
     # Public API
@@ -160,17 +170,41 @@ class CondensationPipeline:
     # ------------------------------------------------------------------
 
     def _call_model(self, prompt: str) -> str:
-        """Run a blocking completion against Gemma."""
-        response = self._client.chat(
-            model=self._config.model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-            options={"temperature": 0.2},  # lower temp -> more structured output
-        )
-        try:
-            return response["message"]["content"]
-        except (KeyError, TypeError):
-            return ""
+        """Run a blocking completion against Gemma.
+
+        When an injected ``client`` is present (test mocks, legacy DI)
+        we preserve the original Ollama-shape contract so existing
+        tests continue to work unchanged. Otherwise we route through
+        the active backend via :mod:`gemma.client`, which already
+        handles backend selection and the streaming → content/metrics
+        tuple shape.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        if self._client is not None:
+            response = self._client.chat(
+                model=self._config.model,
+                messages=messages,
+                stream=False,
+                options={"temperature": 0.2},  # lower temp -> more structured output
+            )
+            try:
+                return response["message"]["content"]
+            except (KeyError, TypeError):
+                return ""
+
+        # Production path: stream-but-non-streaming through the backend.
+        # Lower the temperature for structured-output stability via a
+        # short-lived config override; everything else inherits.
+        from dataclasses import replace as _replace
+
+        from gemma.client import chat as backend_chat
+
+        cfg = _replace(self._config, temperature=0.2)
+        parts: list[str] = []
+        for kind, text in backend_chat(messages, cfg, stream=False):
+            if kind == "content":
+                parts.append(text)
+        return "".join(parts)
 
     def _parse_extraction_response(self, raw: str) -> list[dict]:
         """Robustly parse Gemma's JSON output.

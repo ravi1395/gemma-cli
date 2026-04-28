@@ -2,7 +2,9 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backed recursive summarization memory system** — giving a 4B parameter model cross-session long-term memory that effectively bypasses its token-window limit.
+A local CLI for Google's Gemma 4 model (default backend: **LM Studio**, with Ollama also supported) and a **Redis-backed recursive summarization memory system** — giving a 4B parameter model cross-session long-term memory that effectively bypasses its token-window limit.
+
+On Apple Silicon, gemma-cli auto-selects the MLX build of Gemma 4 E4B; everywhere else it picks the GGUF Q4 build. Bring your own model from HuggingFace with `gemma model pull <owner/repo>`.
 
 ---
 
@@ -19,9 +21,15 @@ A local CLI for Google's Gemma 4 model (running via Ollama) with a **Redis-backe
 - [How the memory system improves Gemma](#how-the-memory-system-improves-gemma)
 - [Scaling to larger Gemma models](#scaling-to-larger-gemma-models)
 - [Installation](#installation)
-  - [Quick setup (recommended)](#quick-setup-recommended)
-  - [Quick setup — Windows](#quick-setup--windows)
+  - [Quick setup with `uv` (recommended)](#quick-setup-with-uv-recommended)
   - [Manual setup](#manual-setup)
+- [Backends](#backends)
+  - [LM Studio (default)](#lm-studio-default)
+  - [Ollama (legacy)](#ollama-legacy)
+  - [Switching between backends](#switching-between-backends)
+- [Model selection](#model-selection)
+  - [Platform-aware defaults](#platform-aware-defaults)
+  - [Custom HuggingFace models](#custom-huggingface-models)
 - [Reducing Ollama memory footprint](#reducing-ollama-memory-footprint)
 - [Running Redis](#running-redis)
   - [Native (macOS)](#native-macos)
@@ -336,90 +344,124 @@ The one case where latency surfaces directly is `reconsolidate()`, which is trig
 
 ## Installation
 
-### Quick setup (recommended)
+### Quick setup with `uv` (recommended)
 
-`setup.sh` handles everything automatically — Python, Redis, Ollama, models, and tests. Docker is **not required**.
+[`uv`](https://docs.astral.sh/uv/) is the official package and environment manager. It creates the virtual environment, resolves dependencies from the lock file, and exposes the `gemma` script in one command.
+
+**Prerequisites:**
+- `uv` ≥ 0.4 — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- [LM Studio](https://lmstudio.ai/) installed and running, with a chat model loaded (see [Model selection](#model-selection) for the recommended pick)
+- Redis (only required if you use the memory or RAG features) — native install or `docker compose up redis -d`
 
 ```bash
 git clone <repo-url> gemma-cli
 cd gemma-cli
-chmod +x setup.sh
-./setup.sh
+uv sync                    # creates .venv, installs deps, builds the script
+uv run gemma model info    # confirms backend + auto-resolved model
+uv run gemma ask "hello"
 ```
 
-**What the script does:**
-1. Detects your OS (macOS or Linux)
-2. Installs Python ≥ 3.10 if missing (`brew` / `apt-get` / `dnf`)
-3. Creates and activates a `.venv` virtual environment
-4. Installs gemma-cli with all dependencies (`pip install -e ".[memory,dev]"`)
-5. Ensures Redis is running — installs natively (`brew install redis` on macOS, `apt-get`/`dnf` on Linux); falls back to Docker only if Docker is already available and a native install cannot be performed
-6. Installs Ollama if missing (`brew install ollama` on macOS, official install script on Linux)
-7. Pulls `gemma4:e2b` (~3–4 GB) and `nomic-embed-text` (~274 MB) into Ollama
-8. Runs the full test suite to confirm everything is wired up
+**Useful uv commands while developing:**
 
 ```bash
-# Skip model pulls on slow connections
-./setup.sh --skip-models
-
-# Skip the test suite
-./setup.sh --skip-tests
-```
-
-Re-running is safe — every step is idempotent and skips work already done.
-
-### Quick setup — Windows
-
-`setup.ps1` is the PowerShell equivalent for Windows. It uses `winget` or Chocolatey to install missing dependencies.
-
-```powershell
-git clone <repo-url> gemma-cli
-cd gemma-cli
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\setup.ps1
-```
-
-**What the script does:**
-1. Installs Python ≥ 3.10 if missing (via `winget` or `choco`)
-2. Creates and activates a `.venv` virtual environment
-3. Installs gemma-cli with all dependencies
-4. Ensures Redis is running — installs via `winget`/Chocolatey or [Memurai](https://www.memurai.com/) (Redis-compatible for Windows); falls back to Docker if already available
-5. Installs Ollama if missing (via `winget` or `choco`)
-6. Pulls `gemma4:e2b` and `nomic-embed-text` into Ollama
-7. Runs the full test suite
-
-```powershell
-# Skip model pulls
-.\setup.ps1 -SkipModels
-
-# Skip tests
-.\setup.ps1 -SkipTests
+uv run pytest              # run the full test suite
+uv run gemma chat          # start an interactive REPL
+uv add <package>           # add a runtime dependency
+uv add --group dev <pkg>   # add a dev-only dependency
+uv lock --upgrade          # refresh the lock file
 ```
 
 ### Manual setup
 
-**Prerequisites:** Python ≥ 3.10, [Ollama](https://ollama.com) installed and running, Redis (native or Docker).
+If you'd rather not use `uv`, a plain `pip` install works too:
 
-**macOS / Linux:**
 ```bash
 git clone <repo-url> gemma-cli
 cd gemma-cli
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate                # or: .venv\Scripts\Activate.ps1
 pip install -e ".[memory]"
-ollama pull gemma4:e2b
-ollama pull nomic-embed-text
+gemma model info
 ```
 
-**Windows (PowerShell):**
-```powershell
-git clone <repo-url> gemma-cli
-cd gemma-cli
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e ".[memory]"
-ollama pull gemma4:e2b
+To use the legacy Ollama backend instead of LM Studio, install with the `ollama` extra:
+
+```bash
+pip install -e ".[memory,ollama]"
+ollama pull gemma3:4b
 ollama pull nomic-embed-text
+gemma --backend ollama ask "hello"
 ```
+
+---
+
+## Backends
+
+### LM Studio (default)
+
+[LM Studio](https://lmstudio.ai/) is the default runtime. It auto-loads models on first use, holds them in RAM under a TTL (`ollama_keep_alive` in profiles) and unloads them when idle.
+
+The native [`lmstudio`](https://pypi.org/project/lmstudio/) Python SDK gives us:
+- **JIT model loading** with TTL-based eviction.
+- **Structured reasoning fragments** — every streaming token carries a `reasoning_type` field, so we route think vs. content tokens to the right channel without parsing `<think>` tags.
+- **Embeddings** with the same JIT/TTL behaviour.
+
+LM Studio's gateway listens on `localhost:1234` by default; gemma-cli uses the SDK's defaults unless `lmstudio_host` is pinned in a profile.
+
+### Ollama (legacy)
+
+The original Ollama backend is still available behind the `ollama` extra. Pin it per-call with `gemma --backend ollama ...` or per-profile with `backend = "ollama"`.
+
+### Switching between backends
+
+| Scope | How |
+|---|---|
+| Single invocation | `gemma --backend ollama ask "..."` |
+| Persistent (per-profile) | `backend = "ollama"` in `~/.config/gemma/profiles/<name>.toml` |
+| Process-wide | `Config(backend="ollama")` in any embedding code |
+
+`gemma model info` always prints the resolved backend, model, and host so you can confirm which runtime will handle the next call.
+
+---
+
+## Model selection
+
+### Platform-aware defaults
+
+When `model` is not pinned in a profile, gemma-cli auto-selects:
+
+| Platform | Default chat model | Default embedding model |
+|---|---|---|
+| macOS arm64 (Apple Silicon) | `mlx-community/gemma-4-E4B-it-4bit` | `nomic-ai/nomic-embed-text-v1.5` |
+| Everything else | `lmstudio-community/gemma-3-4B-it-GGUF` | `nomic-ai/nomic-embed-text-v1.5-GGUF` |
+
+The MLX build is fastest on M-series chips because it uses Apple's Metal/MLX runtime. The GGUF builds run anywhere LM Studio runs (CPU, CUDA, ROCm).
+
+`gemma model info` shows the resolved defaults for the current machine.
+
+### Custom HuggingFace models
+
+Two ways to bring your own model:
+
+**1. Pin in a profile or via the CLI:**
+
+```bash
+# Persist it: pins the model in ~/.config/gemma/profiles/work.toml
+gemma model use lmstudio-community/Llama-3.2-3B-Instruct-GGUF -p work
+gemma --profile work ask "hello"
+
+# Or just for this invocation, edit the profile by hand.
+```
+
+**2. Pull a fresh model from HuggingFace:**
+
+```bash
+# Requires the `lms` CLI — bootstrap once with: npx lmstudio install-cli
+gemma model pull mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+gemma model use mlx-community/Qwen2.5-Coder-7B-Instruct-4bit -p coder
+```
+
+`gemma model list` shows what's loaded; `gemma model list --downloaded` shows everything on disk.
 
 ---
 
@@ -1168,20 +1210,22 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 
 | Field | Default | Description |
 |---|---|---|
-| `model` | `gemma4:e2b` | Ollama model tag for chat and condensation |
+| `backend` | `"lmstudio"` | LLM runtime: `"lmstudio"` (default) or `"ollama"`. Override per call with `--backend`. |
+| `model` | _(auto)_ | Chat model identifier. `None` / `""` resolves to `mlx-community/gemma-4-E4B-it-4bit` on Apple Silicon and `lmstudio-community/gemma-3-4B-it-GGUF` elsewhere. Set explicitly to a HuggingFace `owner/repo` (LM Studio) or Ollama tag to override. |
 | `system_prompt` | `"You are a helpful assistant."` | Default system message |
 | `temperature` | `0.7` | Sampling temperature for chat (condensation always uses 0.2) |
 | `context_window` | `16384` | Total token budget; 75% is used for input, 25% reserved for response |
 | `history_file` | `~/.gemma_history.json` | Path for the JSON fallback session history |
-| `ollama_host` | `http://localhost:11434` | Ollama server base URL |
+| `lmstudio_host` | `""` _(SDK default)_ | LM Studio gateway address; empty = `localhost:1234`. |
+| `ollama_host` | `http://localhost:11434` | Ollama server base URL (only used when `backend = "ollama"`) |
 | `memory_enabled` | `True` | Master switch; set `False` to disable all Redis/embedding features |
-| `thinking_mode` | `False` | Enable Gemma 4 extended thinking; the model reasons step-by-step before responding |
-| `ollama_keep_alive` | `"2m"` | How long Ollama keeps the model loaded in RAM between calls. Accepts duration strings (`"2m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
+| `thinking_mode` | `False` | Show extended-reasoning tokens (think channel) in the output. |
+| `ollama_keep_alive` | `"2m"` | How long the runtime keeps the model loaded in RAM between calls. Maps to LM Studio's TTL when `backend = "lmstudio"`. Accepts duration strings (`"2m"`, `"2h"`) or `"-1"` to pin indefinitely / `"0"` to evict immediately. Overridable per-call with `--keep-alive`. |
 | `cache_enabled` | `True` | Master switch for the SHA-keyed response cache |
 | `cache_ttl_seconds` | `3600` | Cache entry TTL in seconds; `0` disables all caching |
 | `cache_temperature_max` | `0.3` | Skip caching for calls with temperature above this value |
 | `redis_url` | `redis://localhost:6379/0` | Redis connection string |
-| `embedding_model` | `nomic-embed-text` | Ollama model used for 768-dim embeddings |
+| `embedding_model` | _(auto)_ | Embedding model identifier. `None` / `""` resolves to `nomic-ai/nomic-embed-text-v1.5` (or `-GGUF` off Apple Silicon). |
 | `sliding_window_size` | `8` | Number of raw turns kept in the Redis list |
 | `memory_top_k` | `5` | Number of memories retrieved per turn |
 | `memory_min_similarity` | `0.3` | Cosine similarity threshold for retrieval (0–1) |

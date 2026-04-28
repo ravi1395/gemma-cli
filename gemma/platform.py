@@ -220,6 +220,58 @@ def rc_file_for(shell: Shell, os_: Optional[OS] = None) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Default model resolution (Apple Silicon → MLX, otherwise → GGUF Q4)
+# ---------------------------------------------------------------------------
+#
+# LM Studio identifies models by their HuggingFace path. The defaults
+# below are deliberately first-party MLX builds on macOS arm64 (single
+# fused weights file, fastest on Apple Silicon GPUs) and lmstudio-
+# community GGUF builds elsewhere (broadest CPU/CUDA support).
+#
+# Users override per-profile via ``Config.model = "owner/repo"``.
+# Empty-string overrides resolve to the auto-default — so a profile can
+# set ``model = ""`` to opt back into the platform-specific choice.
+
+def is_apple_silicon() -> bool:
+    """True when running on macOS arm64 — the trigger for MLX defaults.
+
+    Checked via stdlib ``platform.machine()`` because it reflects the
+    Python interpreter's actual architecture (an x86_64 Python under
+    Rosetta returns ``"x86_64"`` even on an M-series chip — which is
+    exactly the right answer; MLX won't load there).
+    """
+    return detect_os() is OS.MACOS and _stdlib_platform.machine() == "arm64"
+
+
+def default_chat_model() -> str:
+    """Return the platform-appropriate default chat model.
+
+    Apple Silicon → ``mlx-community/gemma-4-E4B-it-4bit``
+    Anything else → ``lmstudio-community/gemma-3-4B-it-GGUF``
+
+    Returns an LM Studio model identifier (HuggingFace ``owner/repo``
+    form). The Ollama backend ignores this — it has its own model
+    universe — so profiles using ``backend = "ollama"`` should pin
+    ``model`` explicitly to an Ollama tag (e.g. ``"gemma3:4b"``).
+    """
+    if is_apple_silicon():
+        return "mlx-community/gemma-4-E4B-it-4bit"
+    return "lmstudio-community/gemma-3-4B-it-GGUF"
+
+
+def default_embedding_model() -> str:
+    """Return the platform-appropriate default embedding model.
+
+    Both branches resolve to a 768-dim ``nomic-embed-text-v1.5`` build
+    so existing Redis-backed memory indexes stay queryable across
+    platform switches.
+    """
+    if is_apple_silicon():
+        return "nomic-ai/nomic-embed-text-v1.5"
+    return "nomic-ai/nomic-embed-text-v1.5-GGUF"
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
 

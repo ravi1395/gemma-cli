@@ -12,7 +12,7 @@ top-level --profile CLI flag.
 import warnings
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 # TTL mapping by importance score (1-5). None = no expiry.
@@ -36,21 +36,39 @@ class Config:
     """
 
     # --- Base CLI ---
-    model: str = "gemma4:e2b"
+    # ``model`` and ``embedding_model`` are auto-resolved to platform-
+    # appropriate defaults (Apple Silicon → MLX builds, others → GGUF Q4)
+    # when set to ``None``. Explicit user/profile overrides always win.
+    # See :func:`gemma.platform.default_chat_model` for the resolution
+    # rules.
+    model: Optional[str] = None
     system_prompt: str = "You are a helpful assistant."
     temperature: float = 0.7
-    # Ollama pre-allocates a KV cache sized to this value, independent of the
-    # actual prompt length — 16k covers chat / ask / commit / sh / code review
-    # comfortably while keeping KV cache in the hundreds of MB rather than
-    # multiple GB. Bump via profile for long-document RAG or sessions that
-    # approach 100+ turns, but expect a proportional jump in resident memory.
+    # The chosen backend pre-allocates a KV cache sized to this value,
+    # independent of the actual prompt length — 16k covers chat / ask /
+    # commit / sh / code review comfortably while keeping KV cache in
+    # the hundreds of MB rather than multiple GB. Bump via profile for
+    # long-document RAG or sessions that approach 100+ turns, but
+    # expect a proportional jump in resident memory.
     context_window: int = 16384
     history_file: str = "~/.gemma_history.json"
+    # ----- Backend selection -----
+    # ``lmstudio`` (default) uses the native ``lmstudio`` SDK; ``ollama``
+    # falls back to the legacy Ollama HTTP daemon. Switch via profile or
+    # the top-level ``--backend`` flag.
+    backend: Literal["lmstudio", "ollama"] = "lmstudio"
     ollama_host: str = "http://localhost:11434"
+    # LM Studio's WebSocket gateway. The SDK reads ``LMS_HOST`` env var
+    # too; this field exists so profiles can pin a host without exporting
+    # variables. Empty string = use SDK default (localhost:1234).
+    lmstudio_host: str = ""
     thinking_mode: bool = False  # Gemma 4 extended thinking — off by default (opt-in via --think or profile; roughly doubles tokens per query)
-    # How long Ollama should keep the model resident in RAM between calls.
-    # Any duration string accepted by Ollama ("30m", "2h", "-1" = forever, "0" = evict).
-    # Keeps TTFT low across repeated CLI invocations in the same shell session.
+    # How long the runtime should keep the model resident in RAM between
+    # calls. Accepts either an Ollama duration string ("30m", "2h",
+    # "-1" = forever, "0" = evict) or an int seconds. The LM Studio
+    # backend converts via ``parse_keep_alive_seconds``; the field is
+    # named ``ollama_keep_alive`` for backwards-compatibility with
+    # existing profiles.
     ollama_keep_alive: str = "2m"
     show_context_metrics: bool = True  # Print token-count footer after each response
 
@@ -134,7 +152,9 @@ class Config:
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
-    embedding_model: str = "nomic-embed-text"
+    # See ``model`` for the auto-resolution rule. Set to a string in a
+    # profile to pin a specific embedding model.
+    embedding_model: Optional[str] = None
     sliding_window_size: int = 8           # raw turns retained in context
     memory_top_k: int = 5                  # condensed memories retrieved per turn
     memory_min_similarity: float = 0.3     # cosine threshold for retrieval
@@ -144,6 +164,23 @@ class Config:
     ttl_map: dict[int, Optional[int]] = field(
         default_factory=lambda: dict(_DEFAULT_TTL_MAP)
     )
+
+    def __post_init__(self) -> None:
+        """Resolve auto-detected fields (``None``/empty → platform default).
+
+        Kept lightweight so dataclass construction stays cheap. Imports
+        happen lazily because :mod:`gemma.platform` pulls in stdlib-only
+        helpers but we still want zero work on construction when the
+        caller has set everything explicitly.
+        """
+        if self.model in (None, ""):
+            from gemma.platform import default_chat_model
+
+            object.__setattr__(self, "model", default_chat_model())
+        if self.embedding_model in (None, ""):
+            from gemma.platform import default_embedding_model
+
+            object.__setattr__(self, "embedding_model", default_embedding_model())
 
     def resolved_history_path(self) -> Path:
         """Return the history file path with ~ expanded to the user's home."""

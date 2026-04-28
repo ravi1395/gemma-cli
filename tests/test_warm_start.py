@@ -118,15 +118,19 @@ def test_warm_start_skipped_when_disabled(monkeypatch, real_spawn):
 # ---------------------------------------------------------------------------
 
 def test_warm_ollama_swallows_connection_errors(monkeypatch):
-    """Any error from ``ollama.Client.chat`` must stay inside the helper."""
+    """Any error from ``ollama.Client.chat`` must stay inside the helper.
+
+    Pinned to the Ollama backend so the patch site is well-defined; the
+    LM Studio path has its own coverage in ``test_backend_lmstudio.py``.
+    """
     import ollama
 
     fake_client = MagicMock()
     fake_client.chat.side_effect = ConnectionRefusedError("no ollama here")
     monkeypatch.setattr(ollama, "Client", lambda host=None: fake_client)
 
-    cfg = Config()
-    main_module._warm_ollama(cfg)  # must not raise
+    cfg = Config(backend="ollama")
+    main_module._warm_chat(cfg)  # must not raise
     fake_client.chat.assert_called_once()
 
 
@@ -139,5 +143,5 @@ def test_warm_embedder_swallows_client_construction_failure(monkeypatch):
 
     monkeypatch.setattr(ollama, "Client", _boom)
 
-    cfg = Config()
+    cfg = Config(backend="ollama")
     main_module._warm_embedder(cfg)  # must not raise

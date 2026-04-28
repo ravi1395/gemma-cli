@@ -4,3 +4,9 @@ docs/tasks/*
 **/__pycache__/
 *.py[cod]
 *.pyo
+
+# uv / hatchling
+.venv/
+*.egg-info/
+dist/
+build/
