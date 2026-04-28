@@ -117,6 +117,51 @@ class ToolResult:
 _registry: Dict[str, Tuple[ToolSpec, ToolHandler]] = {}
 
 
+# ---------------------------------------------------------------------------
+# Lazy builtin bootstrap
+# ---------------------------------------------------------------------------
+#
+# Importing every ``gemma.tools.builtins.*`` module at process start used
+# to add ~125 ms / ~20 MB to every CLI invocation, even ``gemma --help``.
+# Now the read entry-points (``get``, ``mount``, ``all_specs``,
+# ``registry``) call :func:`bootstrap_builtins` on first access — the
+# decorators run only when a tool is actually about to be looked up.
+
+_BUILTINS_LOADED: bool = False
+
+
+def bootstrap_builtins() -> None:
+    """Import the built-in tool modules so their ``@tool`` decorators run.
+
+    Idempotent: subsequent calls return immediately. Tests, the agent
+    dispatcher, and any code that wants the registry pre-warmed can
+    invoke this directly; otherwise it fires automatically the first
+    time something reads the registry.
+
+    Failure is swallowed: if the builtins package can't be imported
+    (e.g. a future split-out into an extras package), explicitly-
+    registered tools still work.
+    """
+    global _BUILTINS_LOADED
+    if _BUILTINS_LOADED:
+        return
+    # Set the flag *before* the import so that a second registry-read
+    # triggered during bootstrap (re-entry through @tool decorators)
+    # doesn't loop. Failures still mark the registry as bootstrapped to
+    # avoid retrying on every read.
+    _BUILTINS_LOADED = True
+    try:
+        from gemma.tools import builtins  # noqa: F401
+    except ImportError:
+        pass
+
+
+def _reset_builtins_loaded_for_testing() -> None:
+    """Test-only: re-arm the bootstrap flag so a test can observe it firing."""
+    global _BUILTINS_LOADED
+    _BUILTINS_LOADED = False
+
+
 def register(spec: ToolSpec, handler: ToolHandler) -> None:
     """Insert or replace ``spec``/``handler`` in the registry.
 
@@ -147,10 +192,14 @@ def _unregister(name: str) -> None:
 def get(name: str) -> Tuple[ToolSpec, ToolHandler]:
     """Return the ``(spec, handler)`` for ``name``.
 
+    Triggers the lazy builtin bootstrap on first call so callers don't
+    have to remember it. Cheap on subsequent calls.
+
     Raises:
         KeyError: Unknown tool. The dispatcher translates this into a
             structured error returned to the model.
     """
+    bootstrap_builtins()
     if name not in _registry:
         raise KeyError(name)
     return _registry[name]
@@ -161,8 +210,9 @@ def registry() -> Dict[str, Tuple[ToolSpec, ToolHandler]]:
 
     Copy so callers iterating the result can't see a later
     modification mid-iteration if a tool is registered concurrently
-    (unlikely but cheap to prevent).
+    (unlikely but cheap to prevent). Triggers builtin bootstrap.
     """
+    bootstrap_builtins()
     return dict(_registry)
 
 
@@ -207,8 +257,9 @@ def mount(ctx: GatingContext) -> List[ToolSpec]:
 
     Sort is alphabetical so the advertised list is deterministic,
     which keeps the model's view stable across runs and makes
-    snapshot-style tests trivial.
+    snapshot-style tests trivial. Triggers builtin bootstrap.
     """
+    bootstrap_builtins()
     visible: List[ToolSpec] = []
     for name in sorted(_registry):
         spec, _handler = _registry[name]
@@ -221,8 +272,10 @@ def all_specs() -> List[ToolSpec]:
     """Return every registered :class:`ToolSpec`, regardless of gating.
 
     Used by ``gemma tools list`` to show both mounted and unmounted
-    tools so users can see *why* a tool is unavailable.
+    tools so users can see *why* a tool is unavailable. Triggers
+    builtin bootstrap.
     """
+    bootstrap_builtins()
     return [spec for spec, _ in (_registry[n] for n in sorted(_registry))]
 
 
