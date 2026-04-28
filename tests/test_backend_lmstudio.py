@@ -304,3 +304,69 @@ def test_warm_embed_swallows_exceptions():
         side_effect=RuntimeError("server down"),
     ):
         LMStudioBackend().warm_embed(cfg)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# embed_keep_alive → ttl plumbing
+# ---------------------------------------------------------------------------
+
+def test_embed_uses_embed_keep_alive_ttl():
+    """``Config.embed_keep_alive='30s'`` → ``embedding_model(ttl=30)``."""
+    fake_handle = MagicMock()
+    fake_handle.embed.return_value = [0.1, 0.2]
+    cfg = Config(backend="lmstudio", embed_keep_alive="30s")
+
+    with patch(
+        "gemma.backends.lmstudio_backend.lmstudio.embedding_model",
+        return_value=fake_handle,
+    ) as mock_em:
+        be = LMStudioBackend()
+        be.embed("hello", model="some/embed", config=cfg)
+
+    mock_em.assert_called_once()
+    assert mock_em.call_args.kwargs["ttl"] == 30
+
+
+def test_embed_batch_uses_embed_keep_alive_ttl():
+    fake_handle = MagicMock()
+    fake_handle.embed.return_value = [[0.1], [0.2]]
+    cfg = Config(backend="lmstudio", embed_keep_alive="2m")
+
+    with patch(
+        "gemma.backends.lmstudio_backend.lmstudio.embedding_model",
+        return_value=fake_handle,
+    ) as mock_em:
+        be = LMStudioBackend()
+        be.embed_batch(["a", "b"], model="some/embed", config=cfg)
+
+    assert mock_em.call_args.kwargs["ttl"] == 120
+
+
+def test_warm_embed_uses_embed_keep_alive_ttl():
+    fake_handle = MagicMock()
+    cfg = Config(backend="lmstudio", embed_keep_alive="45s")
+
+    with patch(
+        "gemma.backends.lmstudio_backend.lmstudio.embedding_model",
+        return_value=fake_handle,
+    ) as mock_em:
+        LMStudioBackend().warm_embed(cfg)
+
+    mock_em.assert_called_once()
+    assert mock_em.call_args.kwargs["ttl"] == 45
+
+
+def test_embed_without_config_falls_back_to_default_ttl():
+    """Legacy callers (no config kwarg) still get a sensible short TTL."""
+    fake_handle = MagicMock()
+    fake_handle.embed.return_value = [0.1]
+
+    with patch(
+        "gemma.backends.lmstudio_backend.lmstudio.embedding_model",
+        return_value=fake_handle,
+    ) as mock_em:
+        LMStudioBackend().embed("hi", model="some/embed")
+
+    # 30s is the documented default in ``_embed_ttl`` so a stub call
+    # without config still gets the same short-lived handle real code does.
+    assert mock_em.call_args.kwargs["ttl"] == 30

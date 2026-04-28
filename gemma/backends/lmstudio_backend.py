@@ -221,22 +221,46 @@ class LMStudioBackend(LLMBackend):
     # Embeddings
     # ------------------------------------------------------------------
 
-    def embed(self, text: str, *, model: str) -> np.ndarray:
+    def _embed_ttl(self, config: "Config | None") -> int | None:
+        """Resolve the TTL passed to ``lmstudio.embedding_model(ttl=...)``.
+
+        Reads ``config.embed_keep_alive`` when provided; falls back to
+        ``"30s"`` otherwise so a test stub or legacy caller without a
+        Config still gets a short-lived embed handle (the whole point
+        of this knob is to keep the embedder unloaded between bursts).
+        """
+        raw = getattr(config, "embed_keep_alive", None) if config else None
+        return parse_keep_alive_seconds(raw or "30s")
+
+    def embed(
+        self,
+        text: str,
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> np.ndarray:
         if not text:
             return np.zeros(0, dtype=np.float32)
-        # No config in scope here — fall back to the SDK's stored host
-        # (set on first call by ``_require_lmstudio`` with a sensible
-        # default of ``localhost:1234``).
-        lmstudio = _require_lmstudio()
-        handle = lmstudio.embedding_model(model)
+        lmstudio = _require_lmstudio(
+            getattr(config, "lmstudio_host", None) or None if config else None
+        )
+        handle = lmstudio.embedding_model(model, ttl=self._embed_ttl(config))
         vector = handle.embed(text)
         return np.asarray(vector, dtype=np.float32)
 
-    def embed_batch(self, texts: list[str], *, model: str) -> list[np.ndarray]:
+    def embed_batch(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> list[np.ndarray]:
         if not texts:
             return []
-        lmstudio = _require_lmstudio()
-        handle = lmstudio.embedding_model(model)
+        lmstudio = _require_lmstudio(
+            getattr(config, "lmstudio_host", None) or None if config else None
+        )
+        handle = lmstudio.embedding_model(model, ttl=self._embed_ttl(config))
         try:
             vectors = handle.embed(texts)
             return [np.asarray(v, dtype=np.float32) for v in vectors]
@@ -280,7 +304,9 @@ class LMStudioBackend(LLMBackend):
     def warm_embed(self, config: "Config") -> None:
         try:
             lmstudio = _require_lmstudio(getattr(config, "lmstudio_host", None) or None)
-            handle = lmstudio.embedding_model(config.embedding_model)
+            handle = lmstudio.embedding_model(
+                config.embedding_model, ttl=self._embed_ttl(config)
+            )
             handle.embed(" ")
         except Exception:
             pass

@@ -119,24 +119,46 @@ class OllamaBackend(LLMBackend):
         host = (config.ollama_host if config is not None else None) or "http://localhost:11434"
         return ollama.Client(host=host)
 
-    def embed(self, text: str, *, model: str) -> np.ndarray:
+    def embed(
+        self,
+        text: str,
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> np.ndarray:
         if not text:
             return np.zeros(0, dtype=np.float32)
         ollama = _require_ollama()
         client = ollama.Client()  # uses default OLLAMA_HOST env var fallback
-        response = client.embed(model=model, input=text, keep_alive="30m")
+        # Ollama's embed-side keep_alive is hard-coded to a sensible
+        # 30m here; ``config.embed_keep_alive`` is honoured by the
+        # LM Studio backend but Ollama's tagged models don't benefit
+        # from a shorter TTL the same way (they're already small).
+        keep_alive = (
+            getattr(config, "embed_keep_alive", None) if config else None
+        ) or "30m"
+        response = client.embed(model=model, input=text, keep_alive=keep_alive)
         vectors = response.get("embeddings") or []
         if not vectors:
             return np.zeros(0, dtype=np.float32)
         return np.asarray(vectors[0], dtype=np.float32)
 
-    def embed_batch(self, texts: list[str], *, model: str) -> list[np.ndarray]:
+    def embed_batch(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> list[np.ndarray]:
         if not texts:
             return []
         ollama = _require_ollama()
         client = ollama.Client()
+        keep_alive = (
+            getattr(config, "embed_keep_alive", None) if config else None
+        ) or "30m"
         try:
-            response = client.embed(model=model, input=texts, keep_alive="30m")
+            response = client.embed(model=model, input=texts, keep_alive=keep_alive)
             vectors = response.get("embeddings") or []
             return [np.asarray(v, dtype=np.float32) for v in vectors]
         except Exception as exc:
@@ -149,7 +171,7 @@ class OllamaBackend(LLMBackend):
             for text in texts:
                 try:
                     single = client.embed(
-                        model=model, input=text, keep_alive="30m"
+                        model=model, input=text, keep_alive=keep_alive
                     )
                     vecs = single.get("embeddings") or []
                     results.append(

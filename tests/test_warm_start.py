@@ -145,3 +145,39 @@ def test_warm_embedder_swallows_client_construction_failure(monkeypatch):
 
     cfg = Config(backend="ollama")
     main_module._warm_embedder(cfg)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Contract 4: embed warm-start is gated on ``memory_enabled``
+# ---------------------------------------------------------------------------
+#
+# A plain ``gemma ask "..."`` with ``memory_enabled=False`` should never
+# load the embedding model into the runtime — it isn't going to embed
+# anything. Loading ~500 MB of nomic-embed only to evict it 30 seconds
+# later is the bug we ship this gate to fix.
+
+def test_embed_warm_skipped_when_memory_disabled(monkeypatch, real_spawn):
+    """No ``_warm_embedder`` thread spawn when ``memory_enabled=False``."""
+    spy = _ThreadSpy()
+    monkeypatch.setattr("gemma.main.threading.Thread", spy)
+
+    cfg = Config(warm_start=True, in_test_mode=False, memory_enabled=False)
+    main_module._spawn_warm_start(cfg)
+
+    # Exactly one spawn — the chat warmer — and nothing for the embedder.
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["target"] is main_module._warm_chat
+    assert main_module._warm_embedder not in {c["target"] for c in spy.calls}
+
+
+def test_embed_warm_still_runs_when_memory_enabled(monkeypatch, real_spawn):
+    """``memory_enabled=True`` (default) preserves the two-spawn behaviour."""
+    spy = _ThreadSpy()
+    monkeypatch.setattr("gemma.main.threading.Thread", spy)
+
+    cfg = Config(warm_start=True, in_test_mode=False, memory_enabled=True)
+    main_module._spawn_warm_start(cfg)
+
+    targets = {c["target"] for c in spy.calls}
+    assert main_module._warm_chat in targets
+    assert main_module._warm_embedder in targets

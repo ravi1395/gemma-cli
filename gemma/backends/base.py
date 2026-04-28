@@ -79,20 +79,41 @@ class LLMBackend(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def embed(self, text: str, *, model: str) -> np.ndarray:
+    def embed(
+        self,
+        text: str,
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> np.ndarray:
         """Return the embedding vector for a single string as float32.
 
         Empty inputs must return a length-0 array so the caller can
         detect "this chunk was unembeddable" without an exception.
+
+        ``config`` is optional and only consulted by backends that
+        support per-call tuning — currently :class:`LMStudioBackend`
+        reads ``config.embed_keep_alive`` to set the JIT-loaded
+        embedding model's TTL. ``None`` falls back to backend defaults
+        so existing call sites and test stubs need no changes.
         """
 
     @abstractmethod
-    def embed_batch(self, texts: list[str], *, model: str) -> list[np.ndarray]:
+    def embed_batch(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        config: "Config | None" = None,
+    ) -> list[np.ndarray]:
         """Embed a batch of strings.
 
         Implementations should fall back to per-item embedding when
         the batch call rejects an oversized input — only the offending
         chunk should be lost, never the whole batch.
+
+        ``config`` semantics match :meth:`embed` — optional, used for
+        per-call TTL on backends that support it.
         """
 
     # ------------------------------------------------------------------
