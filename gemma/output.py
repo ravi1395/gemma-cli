@@ -110,23 +110,33 @@ def render_response(
     """
     start = time.monotonic()
     chunks: list[str] = []
-    thinking_parts: list[str] = []
-    metrics_parts: list[str] = []
+    # Only the RICH non-stream path renders thinking back out, so other
+    # modes drop think chunks on the floor instead of buffering them.
+    # ``None`` is the "do not collect" sentinel so a long reasoning chain
+    # in JSON/ONLY/CODE mode never costs RAM.
+    thinking_parts: Optional[list[str]] = (
+        [] if mode == OutputMode.RICH and not stream else None
+    )
+    # Backends emit metrics exactly once (end-of-stream), so a scalar is
+    # enough — no need to retain a list whose only consumer reads [-1].
+    metrics_raw: Optional[str] = None
     finished = False
 
     if mode == OutputMode.RICH:
         # Streaming path — render inline as chunks arrive.
-        finished = _render_rich(generator, stream, chunks, thinking_parts, metrics_parts)
-        if show_metrics and metrics_parts:
-            _apply_metrics(metrics_parts[-1], context_window)
+        finished, metrics_raw = _render_rich(
+            generator, stream, chunks, thinking_parts
+        )
+        if show_metrics and metrics_raw is not None:
+            _apply_metrics(metrics_raw, context_window)
     else:
-        # Non-streaming: collect everything first, then render.
+        # Non-streaming: collect content + last metrics, drop the rest.
         try:
             for chunk_type, text in generator:
                 if chunk_type == "think":
-                    thinking_parts.append(text)
+                    pass  # thinking is unused in JSON/ONLY/CODE modes
                 elif chunk_type == "metrics":
-                    metrics_parts.append(text)
+                    metrics_raw = text
                 else:
                     chunks.append(text)
             finished = True
@@ -172,26 +182,30 @@ def _render_rich(
     generator: Iterator[Tuple[str, str]],
     stream: bool,
     chunks: list[str],
-    thinking_parts: list[str],
-    metrics_parts: list[str],
-) -> bool:
+    thinking_parts: Optional[list[str]],
+) -> Tuple[bool, Optional[str]]:
     """Render in RICH mode (streaming or batched Markdown).
 
-    Mutates *chunks*, *thinking_parts*, and *metrics_parts* in-place so the
-    caller has the collected text available after return.
+    Mutates *chunks* in-place so the caller has the collected content
+    available for the return value. *thinking_parts*, when not ``None``,
+    is also mutated; ``None`` means "drop thinking chunks" (the
+    streaming path renders them inline and never collects).
 
     Args:
         generator:      Source of (chunk_type, text) pairs.
         stream:         True → print each chunk as it arrives.
         chunks:         Accumulator for content chunks.
-        thinking_parts: Accumulator for thinking chunks.
-        metrics_parts:  Accumulator for metrics JSON strings.
+        thinking_parts: Accumulator for thinking chunks, or ``None`` to
+                        skip collection entirely.
 
     Returns:
-        True only when the generator was consumed cleanly to its end.
-        A mid-stream exception (network drop, ``generator.throw()``,
-        Ctrl-C) returns False so callers can skip cache writes (#6).
+        ``(finished, metrics_raw)``. ``finished`` is True only when the
+        generator was consumed cleanly to its end; a mid-stream exception
+        (network drop, ``generator.throw()``, Ctrl-C) returns False so
+        callers can skip cache writes (#6). ``metrics_raw`` is the last
+        metrics JSON string emitted, or ``None`` if no metrics arrived.
     """
+    metrics_raw: Optional[str] = None
     if stream:
         had_thinking = False
         first_content = True
@@ -203,7 +217,7 @@ def _render_rich(
                         had_thinking = True
                     console.print(text, end="", soft_wrap=True, highlight=False, style="dim italic")
                 elif chunk_type == "metrics":
-                    metrics_parts.append(text)
+                    metrics_raw = text
                 else:
                     if had_thinking and first_content:
                         console.print()  # newline after the last thinking chunk
@@ -212,26 +226,27 @@ def _render_rich(
                     console.print(text, end="", soft_wrap=True, highlight=False)
         except Exception:
             console.print()
-            return False
+            return False, metrics_raw
         console.print()
-        return True
+        return True, metrics_raw
     else:
         try:
             for chunk_type, text in generator:
                 if chunk_type == "think":
-                    thinking_parts.append(text)
+                    if thinking_parts is not None:
+                        thinking_parts.append(text)
                 elif chunk_type == "metrics":
-                    metrics_parts.append(text)
+                    metrics_raw = text
                 else:
                     chunks.append(text)
         except Exception:
-            return False
+            return False, metrics_raw
         if thinking_parts:
             console.rule("[dim]thinking[/dim]", style="dim")
             console.print("".join(thinking_parts), style="dim italic")
             console.rule(style="dim")
         console.print(Markdown("".join(chunks)))
-        return True
+        return True, metrics_raw
 
 
 def _render_json(content: str, model: Optional[str], elapsed_ms: int) -> None:

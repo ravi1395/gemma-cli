@@ -27,9 +27,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Generator
 
-import numpy as np
-
 if TYPE_CHECKING:  # avoid runtime import cycle with config.py
+    import numpy as np
+
     from gemma.config import Config
 
 
