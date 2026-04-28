@@ -47,7 +47,16 @@ class MemoryManager:
         session_id: Optional[str] = None,
     ):
         self._config = config
-        self._store = store or MemoryStore(config)
+        # Storage backend selection lives in :mod:`gemma.storage`; the
+        # factory returns a Redis or SQLite implementation that matches
+        # the legacy ``MemoryStore`` public surface so this manager
+        # never has to know which is in use.
+        if store is not None:
+            self._store = store
+        else:
+            from gemma.storage import build_memory_store
+
+            self._store = build_memory_store(config)
         self._embedder = embedder or Embedder(
             model=config.embedding_model,
             host=config.ollama_host,
@@ -69,15 +78,18 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def initialize(self) -> bool:
-        """Attempt to connect to Redis. Returns True if memory is fully online."""
+        """Open the storage backend. Returns True if memory is fully online."""
         if not self._config.memory_enabled:
             self._degraded = True
             return False
         ok = self._store.connect()
         self._degraded = not ok
         if self._degraded:
+            backend = getattr(self._config, "storage_backend", "sqlite")
             logger.warning(
-                "Memory system unavailable (Redis not reachable). Running without memory."
+                "Memory system unavailable (%s store not reachable). "
+                "Running without memory.",
+                backend,
             )
         return ok
 

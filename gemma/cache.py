@@ -130,7 +130,15 @@ class ResponseCache:
             and cfg.temperature <= cfg.cache_temperature_max
         ):
             return None
-        return prebuilt if prebuilt is not None else build_cache(cfg)
+        if prebuilt is not None:
+            return prebuilt
+        # Route through the storage factory so SQLite installations
+        # don't need a Redis connection just to cache responses. The
+        # factory falls back to Redis when ``cfg.storage_backend ==
+        # "redis"`` so legacy users see no behaviour change.
+        from gemma.storage import build_response_cache
+
+        return build_response_cache(cfg)
 
     # ------------------------------------------------------------------
     # Internal helpers
