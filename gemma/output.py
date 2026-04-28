@@ -23,7 +23,11 @@ from enum import Enum
 from typing import Generator, Iterator, Optional, Tuple
 
 from rich.console import Console
-from rich.markdown import Markdown
+
+# ``rich.markdown.Markdown`` pulls the ``markdown_it`` parser
+# (~50 modules, ~6 ms cumulative). Only the RICH non-stream path
+# renders a parsed Markdown block; deferring the import keeps fast
+# CLI invocations (``gemma --help``, ``gemma history show``) cheap.
 
 console = Console()
 
@@ -245,6 +249,8 @@ def _render_rich(
             console.rule("[dim]thinking[/dim]", style="dim")
             console.print("".join(thinking_parts), style="dim italic")
             console.rule(style="dim")
+        from rich.markdown import Markdown
+
         console.print(Markdown("".join(chunks)))
         return True, metrics_raw
 

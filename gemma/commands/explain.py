@@ -25,9 +25,14 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.markdown import Markdown
 
 from gemma.config import Config
+
+# ``rich.markdown.Markdown`` pulls in the ``markdown_it`` parser
+# (~6 ms / ~50 modules at startup). The explain command only renders
+# Markdown on the cache-hit and non-streaming paths, so the import
+# is deferred to the call sites below — ``gemma --help`` and other
+# fast invocations skip the parser entirely.
 
 
 # ``client_chat`` and ``build_cache`` are wrapped as lazy proxies so
@@ -206,6 +211,8 @@ def explain_command(
     cached_content: Optional[str] = cache.get(messages, cfg) if cache else None
 
     if cached_content is not None:
+        from rich.markdown import Markdown
+
         console.print(Markdown(cached_content))
         return
 
@@ -226,6 +233,8 @@ def explain_command(
             console.print()
         else:
             # Collect then render as Markdown (nicer for piped output too).
+            from rich.markdown import Markdown
+
             for _chunk_type, text in client_chat(messages, cfg, stream=stream):
                 chunks.append(text)
             console.print(Markdown("".join(chunks)))
