@@ -126,22 +126,29 @@ class GemmaSession:
 
     @cached_property
     def memory(self) -> "MemoryManager":
-        """MemoryManager wired to the shared Redis client.
+        """MemoryManager wired to the active storage backend.
 
         ``initialize()`` is called here so command handlers do not need to
-        know about the two-step construction protocol.
+        know about the two-step construction protocol. The store is
+        resolved through :func:`gemma.storage.build_memory_store` so
+        SQLite installations don't open a Redis connection just to
+        find out memory is enabled.
 
         Returns:
             An initialised MemoryManager. Inspect ``.degraded`` or
-            ``.available`` after access to check Redis reachability.
+            ``.available`` after access to check store reachability.
         """
         from gemma.memory import MemoryManager
-        from gemma.memory.store import MemoryStore
+        from gemma.storage import build_memory_store
 
-        # Inject the already-connected client so MemoryStore reuses the
-        # same connection. If redis_client is None (Redis unavailable),
-        # MemoryStore will try its own connection and enter degraded mode.
-        store = MemoryStore(self._cfg, client=self.redis_client, pool=self.redis_pool)
+        # Pass the session's Redis handles through — they're ignored on
+        # the SQLite path and reused on the Redis path so we don't open
+        # a second TCP connection.
+        store = build_memory_store(
+            self._cfg,
+            client=self.redis_client if self._cfg.storage_backend == "redis" else None,
+            pool=self.redis_pool if self._cfg.storage_backend == "redis" else None,
+        )
         mgr = MemoryManager(self._cfg, store=store)
         mgr.initialize()
         return mgr
@@ -164,18 +171,26 @@ class GemmaSession:
 
     @cached_property
     def cache(self) -> Optional["ResponseCache"]:
-        """ResponseCache backed by the shared Redis client, or None.
+        """Response cache backed by the active storage backend, or None.
 
-        Returns None when ``cfg.cache_enabled`` is False or Redis is
-        unavailable. Per-request eligibility (no_stream, no_cache,
-        temperature) must still be evaluated by the caller — typically via
+        Returns None when ``cfg.cache_enabled`` is False or the chosen
+        backend is unreachable (Redis only — the SQLite path can't
+        fail this way). Per-request eligibility (no_stream, no_cache,
+        temperature) is still evaluated by the caller via
         ``ResponseCache.eligible(..., prebuilt=session.cache)``.
         """
-        if not self._cfg.cache_enabled or self.redis_client is None:
+        if not self._cfg.cache_enabled:
             return None
-        from gemma.cache import ResponseCache
+        if self._cfg.storage_backend == "redis":
+            if self.redis_client is None:
+                return None
+            from gemma.cache import ResponseCache
 
-        return ResponseCache(self.redis_client, self._cfg.cache_ttl_seconds)
+            return ResponseCache(self.redis_client, self._cfg.cache_ttl_seconds)
+        # SQLite path — open a connection scoped to this session.
+        from gemma.storage import build_response_cache
+
+        return build_response_cache(self._cfg)
 
     # ------------------------------------------------------------------
     # Cross-invocation helpers

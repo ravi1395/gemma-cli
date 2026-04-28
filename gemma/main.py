@@ -61,6 +61,10 @@ from gemma.commands.model import (
     pull_command as model_pull_command,
     use_command as model_use_command,
 )
+from gemma.commands.storage import (
+    info_command as storage_info_command,
+    migrate_command as storage_migrate_command,
+)
 from gemma.commands.shell import (
     install_shell_command,
     sh_command,
@@ -148,6 +152,12 @@ model_app.command("list")(model_list_command)
 model_app.command("use")(model_use_command)
 model_app.command("info")(model_info_command)
 app.add_typer(model_app, name="model")
+
+# Storage management — show backend state, migrate between SQLite and Redis.
+storage_app = typer.Typer(help="Inspect and migrate the gemma-cli storage backend.")
+storage_app.command("info")(storage_info_command)
+storage_app.command("migrate")(storage_migrate_command)
+app.add_typer(storage_app, name="storage")
 
 # Active profile set by --profile flag in the top-level callback.
 # None means "use Config dataclass defaults".

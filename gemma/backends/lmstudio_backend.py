@@ -48,13 +48,40 @@ except ImportError:  # pragma: no cover — exercised only when dep missing
     lmstudio = None  # type: ignore[assignment]
 
 
-def _require_lmstudio():
-    """Return the imported ``lmstudio`` module or raise a friendly error."""
+_default_client_configured = False
+
+
+def _require_lmstudio(host: str | None = None):
+    """Return the imported ``lmstudio`` module or raise a friendly error.
+
+    On first call, eagerly bind the SDK's default client to a known
+    host so subsequent ``lmstudio.llm(...)`` / ``embedding_model(...)``
+    calls don't fail with ``Local API host port is not yet resolved``.
+    The resolution path the SDK uses internally relies on either the
+    ``lms`` CLI's stored default or ``LMS_HOST`` env var; we shortcut
+    that by passing a host explicitly the first time we touch the
+    module.
+
+    Args:
+        host: Optional override (e.g. ``Config.lmstudio_host``). Falls
+            back to ``localhost:1234`` — the SDK's documented default —
+            so a fresh install just works.
+    """
+    global _default_client_configured
     if lmstudio is None:
         raise ImportError(
             "The LM Studio backend requires the 'lmstudio' package. "
             "Install with: uv sync  (or 'pip install lmstudio>=1.3')."
         )
+    if not _default_client_configured:
+        try:
+            lmstudio.configure_default_client(host or "localhost:1234")
+        except Exception:
+            # Already configured by an earlier process / pytest fixture;
+            # ``configure_default_client`` raises on second call. Either
+            # way, the SDK is now ready.
+            pass
+        _default_client_configured = True
     return lmstudio
 
 
@@ -118,7 +145,7 @@ class LMStudioBackend(LLMBackend):
         *,
         stream: bool = True,
     ) -> Generator[ChatChunk, None, None]:
-        lmstudio = _require_lmstudio()
+        lmstudio = _require_lmstudio(getattr(config, "lmstudio_host", None) or None)
 
         ttl = parse_keep_alive_seconds(config.ollama_keep_alive)
         # Resolve the chat model handle. ``ttl`` controls auto-unload; we
@@ -197,6 +224,9 @@ class LMStudioBackend(LLMBackend):
     def embed(self, text: str, *, model: str) -> np.ndarray:
         if not text:
             return np.zeros(0, dtype=np.float32)
+        # No config in scope here — fall back to the SDK's stored host
+        # (set on first call by ``_require_lmstudio`` with a sensible
+        # default of ``localhost:1234``).
         lmstudio = _require_lmstudio()
         handle = lmstudio.embedding_model(model)
         vector = handle.embed(text)
@@ -232,7 +262,7 @@ class LMStudioBackend(LLMBackend):
 
     def warm_chat(self, config: "Config") -> None:
         try:
-            lmstudio = _require_lmstudio()
+            lmstudio = _require_lmstudio(getattr(config, "lmstudio_host", None) or None)
             ttl = parse_keep_alive_seconds(config.ollama_keep_alive)
             model = lmstudio.llm(config.model, ttl=ttl)
             # 1-token probe — same trick as Ollama. The SDK has no
@@ -249,7 +279,7 @@ class LMStudioBackend(LLMBackend):
 
     def warm_embed(self, config: "Config") -> None:
         try:
-            lmstudio = _require_lmstudio()
+            lmstudio = _require_lmstudio(getattr(config, "lmstudio_host", None) or None)
             handle = lmstudio.embedding_model(config.embedding_model)
             handle.embed(" ")
         except Exception:

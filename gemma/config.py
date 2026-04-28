@@ -149,6 +149,15 @@ class Config:
     # of reindex cycles on the same content.
     embed_cache_ttl_days: int = 30
 
+    # --- Storage backend ---
+    # ``sqlite`` (default) keeps memories, RAG vectors, and the response
+    # cache in a single durable file at ``sqlite_path``. ``redis`` is
+    # the legacy server-backed option; pick it via profile when you
+    # already have a populated Redis store you don't want to migrate.
+    # See :mod:`gemma.storage` and ``docs/storage.md``.
+    storage_backend: Literal["sqlite", "redis"] = "sqlite"
+    sqlite_path: str = "~/.gemma/store.sqlite"
+
     # --- Memory system ---
     memory_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"

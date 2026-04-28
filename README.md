@@ -2,9 +2,11 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A local CLI for Google's Gemma 4 model (default backend: **LM Studio**, with Ollama also supported) and a **Redis-backed recursive summarization memory system** — giving a 4B parameter model cross-session long-term memory that effectively bypasses its token-window limit.
+A local CLI for Google's Gemma 4 model (default backend: **LM Studio**, with Ollama also supported) and a **recursive summarization memory system** — giving a 4B parameter model cross-session long-term memory that effectively bypasses its token-window limit.
 
 On Apple Silicon, gemma-cli auto-selects the MLX build of Gemma 4 E4B; everywhere else it picks the GGUF Q4 build. Bring your own model from HuggingFace with `gemma model pull <owner/repo>`.
+
+State persists by default in a single SQLite file at `~/.gemma/store.sqlite` (no server required). Redis remains supported as an optional backend — see [docs/storage.md](docs/storage.md) and [docs/migrating-from-redis.md](docs/migrating-from-redis.md).
 
 ---
 
@@ -27,6 +29,10 @@ On Apple Silicon, gemma-cli auto-selects the MLX build of Gemma 4 E4B; everywher
   - [LM Studio (default)](#lm-studio-default)
   - [Ollama (legacy)](#ollama-legacy)
   - [Switching between backends](#switching-between-backends)
+- [Storage](#storage)
+  - [SQLite (default)](#sqlite-default)
+  - [Redis (legacy)](#redis-legacy)
+  - [`gemma storage` subcommands](#gemma-storage-subcommands)
 - [Model selection](#model-selection)
   - [Platform-aware defaults](#platform-aware-defaults)
   - [Custom HuggingFace models](#custom-huggingface-models)
@@ -76,6 +82,12 @@ The result: Gemma remembers your preferences, ongoing projects, and corrections 
 ---
 
 ## Architecture
+
+> Subsystem deep-dives:
+> [`docs/rag.md`](docs/rag.md) (RAG indexer + retriever + storage) ·
+> [`docs/storage.md`](docs/storage.md) (SQLite/Redis schema, pragmas, perf) ·
+> [`docs/migrating-from-redis.md`](docs/migrating-from-redis.md) ·
+> [`docs/migrating-from-ollama.md`](docs/migrating-from-ollama.md)
 
 ### The memory problem
 
@@ -421,6 +433,51 @@ The original Ollama backend is still available behind the `ollama` extra. Pin it
 | Process-wide | `Config(backend="ollama")` in any embedding code |
 
 `gemma model info` always prints the resolved backend, model, and host so you can confirm which runtime will handle the next call.
+
+---
+
+## Storage
+
+gemma-cli persists three things between sessions:
+
+1. **Memories** — structured facts the condensation pipeline extracts from your conversations (with embeddings + per-session sliding window of recent turns).
+2. **RAG vectors** — chunked workspace files, partitioned by `{repo_hash}:{branch}` namespace.
+3. **Caches** — content-hash → embedding (so re-indexing skips work) and SHA-keyed prompt → response.
+
+### SQLite (default)
+
+Single file at `~/.gemma/store.sqlite`. Zero server, durable on every commit, backup is `cp`. Vector search is brute-force cosine in numpy, plenty fast at our scale (≤500 memories, ≤50k RAG chunks).
+
+```bash
+gemma storage info        # show backend, file path, row counts
+```
+
+Schema, pragmas, and TTL semantics are documented in [docs/storage.md](docs/storage.md).
+
+### Redis (legacy)
+
+Still supported. Pin via profile:
+
+```toml
+# ~/.config/gemma/profiles/default.toml
+storage_backend = "redis"
+redis_url = "redis://localhost:6379/0"
+```
+
+If you have a populated Redis store from earlier versions, run the migrate command instead:
+
+```bash
+gemma storage migrate --from redis --to sqlite
+```
+
+Idempotent and safe — it only inserts into the destination, never mutates the source. Full walkthrough in [docs/migrating-from-redis.md](docs/migrating-from-redis.md).
+
+### `gemma storage` subcommands
+
+| Command | What it does |
+|---|---|
+| `gemma storage info` | Print the resolved backend, file path / Redis URL, row counts, on-disk size. |
+| `gemma storage migrate --from <X> --to <Y>` | Copy memories + RAG chunks + manifest between backends. `--dry-run` for a no-op preview. |
 
 ---
 
@@ -1224,7 +1281,9 @@ All settings live in `gemma/config.py` as a plain dataclass. CLI flags override 
 | `cache_enabled` | `True` | Master switch for the SHA-keyed response cache |
 | `cache_ttl_seconds` | `3600` | Cache entry TTL in seconds; `0` disables all caching |
 | `cache_temperature_max` | `0.3` | Skip caching for calls with temperature above this value |
-| `redis_url` | `redis://localhost:6379/0` | Redis connection string |
+| `storage_backend` | `"sqlite"` | Persistence layer for memories + RAG + caches. `"sqlite"` (default; single file, no server) or `"redis"` (legacy, server-backed). |
+| `sqlite_path` | `~/.gemma/store.sqlite` | Where the SQLite store lives (only used when `storage_backend = "sqlite"`). |
+| `redis_url` | `redis://localhost:6379/0` | Redis connection string (only used when `storage_backend = "redis"`). |
 | `embedding_model` | _(auto)_ | Embedding model identifier. `None` / `""` resolves to `nomic-ai/nomic-embed-text-v1.5` (or `-GGUF` off Apple Silicon). |
 | `sliding_window_size` | `8` | Number of raw turns kept in the Redis list |
 | `memory_top_k` | `5` | Number of memories retrieved per turn |

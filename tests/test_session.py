@@ -25,8 +25,14 @@ from gemma.session import GemmaSession
 # ---------------------------------------------------------------------------
 
 def _cfg() -> Config:
-    """Config that points to a non-existent Redis so production tests are safe."""
-    return Config()
+    """Config pinned to the Redis storage backend so the tests in this
+    module exercise the legacy Redis path (which is what they assert).
+
+    The default ``Config()`` now resolves to SQLite, where
+    ``session.cache`` and ``session.memory`` no longer depend on Redis
+    reachability — those assertions wouldn't make sense.
+    """
+    return Config(storage_backend="redis")
 
 
 @pytest.fixture

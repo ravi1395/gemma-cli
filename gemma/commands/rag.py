@@ -45,8 +45,24 @@ console = Console()
 # factory hooks so tests can inject stub stores/embedders without
 # touching Redis or Ollama. Production code leaves the defaults alone.
 
-def _default_store_factory(namespace: str, redis_url: str) -> RedisVectorStore:
-    return RedisVectorStore(namespace=namespace, redis_url=redis_url)
+def _default_store_factory(namespace: str, redis_url: str) -> Any:
+    """Build a vector store for ``namespace``.
+
+    Note the legacy signature ``(namespace, redis_url)`` is preserved
+    so existing test overrides keep working — they pass a fakeredis
+    store and never look at the second argument. Production code
+    routes through :func:`gemma.storage.build_rag_store` which picks
+    Redis or SQLite based on ``Config.storage_backend``.
+    """
+    cfg = Config()
+    # Honour an explicit redis_url if the caller passed a non-default
+    # value; preserves backwards-compat for any external code that
+    # calls ``set_store_factory`` without going through Config.
+    if redis_url and redis_url != cfg.redis_url:
+        cfg = Config(redis_url=redis_url, storage_backend="redis")
+    from gemma.storage import build_rag_store
+
+    return build_rag_store(cfg, namespace)
 
 
 def _default_embedder_factory(cfg: Config) -> Any:
@@ -54,12 +70,12 @@ def _default_embedder_factory(cfg: Config) -> Any:
 
 
 #: Hookable factories. Tests override these module-level attributes.
-_store_factory: Callable[[str, str], RedisVectorStore] = _default_store_factory
+_store_factory: Callable[[str, str], Any] = _default_store_factory
 _embedder_factory: Callable[[Config], Any] = _default_embedder_factory
 
 
-def set_store_factory(factory: Callable[[str, str], RedisVectorStore]) -> None:
-    """Override the Redis store factory (for tests)."""
+def set_store_factory(factory: Callable[[str, str], Any]) -> None:
+    """Override the vector store factory (for tests)."""
     global _store_factory
     _store_factory = factory
 
@@ -96,14 +112,18 @@ def _wire(
     branch = session.branch_for(root) if session is not None else None
     namespace = resolve_namespace(root, branch=branch)
     store = _store_factory(namespace, cfg.redis_url)
-    # Inject the session's shared client and pool when available
-    # (production path). Tests override _store_factory to return a
-    # pre-wired fakeredis store, so store._client is already set and we
-    # leave it alone.
-    if session is not None and store._client is None:
-        if session.redis_client is not None:
+    # Inject the session's shared client and pool when available — but
+    # only when the store actually has those Redis-specific attributes.
+    # The SQLite store opens its own connection in __init__ and ignores
+    # ``redis_client`` / ``redis_pool`` entirely; ``hasattr`` lets one
+    # call site serve both backends without a per-backend branch.
+    if session is not None and hasattr(store, "_client") and store._client is None:
+        if getattr(session, "redis_client", None) is not None:
             store._client = session.redis_client
-        if session.redis_pool is not None and store._pool is None:
+        if (
+            getattr(session, "redis_pool", None) is not None
+            and getattr(store, "_pool", None) is None
+        ):
             store._pool = session.redis_pool
     embedder = _embedder_factory(cfg)
     return cfg, store, embedder
