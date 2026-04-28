@@ -32,10 +32,28 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from gemma.cache import build_cache
-from gemma.client import chat as client_chat
 from gemma.commands.clipboard import handle_copy_flags
 from gemma.config import Config
+
+
+# Lazy proxies for ``gemma.client.chat`` and ``gemma.cache.build_cache``.
+# Importing this module no longer pulls the chat backend or cache
+# layer in at module load. Tests that patch
+# ``gemma.commands.shell.client_chat`` keep working because the name
+# still exists on the module.
+
+def client_chat(*args, **kwargs):
+    """Lazy proxy to :func:`gemma.client.chat`."""
+    from gemma.client import chat as _chat
+
+    return _chat(*args, **kwargs)
+
+
+def build_cache(*args, **kwargs):
+    """Lazy proxy to :func:`gemma.cache.build_cache`."""
+    from gemma.cache import build_cache as _build
+
+    return _build(*args, **kwargs)
 
 
 console = Console()

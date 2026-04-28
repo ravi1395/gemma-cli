@@ -27,9 +27,28 @@ import typer
 from rich.console import Console
 from rich.markdown import Markdown
 
-from gemma.cache import build_cache
-from gemma.client import chat as client_chat
 from gemma.config import Config
+
+
+# ``client_chat`` and ``build_cache`` are wrapped as lazy proxies so
+# importing this command module doesn't pull the chat backend or
+# cache layer into RAM. The wrappers preserve the public name (so
+# tests' ``patch("gemma.commands.explain.client_chat", ...)`` keeps
+# working) while the actual heavy import only fires on first call.
+
+def client_chat(*args, **kwargs):
+    """Lazy proxy to :func:`gemma.client.chat`."""
+    from gemma.client import chat as _chat
+
+    return _chat(*args, **kwargs)
+
+
+def build_cache(*args, **kwargs):
+    """Lazy proxy to :func:`gemma.cache.build_cache`."""
+    from gemma.cache import build_cache as _build
+
+    return _build(*args, **kwargs)
+
 
 # ``MemoryManager`` is imported inside the function body so the
 # explain command stays cheap to load: with-memory is opt-in

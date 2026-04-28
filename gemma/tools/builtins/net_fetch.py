@@ -26,14 +26,30 @@ from pathlib import Path
 from typing import List, Optional
 
 # ``trafilatura`` is an optional dep (install with ``pip install '.[agent]'``).
-# We import it lazily at module load so the rest of the tool works fine
-# when the extra is not installed.
-try:
-    import trafilatura as _trafilatura  # type: ignore[import-not-found]
-    _HAS_TRAFILATURA = True
-except ImportError:
-    _trafilatura = None  # type: ignore[assignment]
-    _HAS_TRAFILATURA = False
+# Importing it pulls a 100-MB-ish chain (lxml, charset-normalizer, etc.)
+# and adds ~100 ms to cold-start, so we defer the import until the first
+# HTML extraction actually fires. ``_load_trafilatura`` caches the
+# result (module or ``None``) so the cost is paid at most once per
+# process.
+_trafilatura: object | None = None
+_trafilatura_loaded = False
+
+
+def _load_trafilatura():
+    """Import ``trafilatura`` on first call; cache the outcome.
+
+    Returns the module when the optional extra is installed, ``None``
+    otherwise. Subsequent calls are O(1) attribute access.
+    """
+    global _trafilatura, _trafilatura_loaded
+    if not _trafilatura_loaded:
+        try:
+            import trafilatura as mod  # type: ignore[import-not-found]
+            _trafilatura = mod
+        except ImportError:
+            _trafilatura = None
+        _trafilatura_loaded = True
+    return _trafilatura
 
 # ``tomllib`` landed in Python 3.11; fall back to ``tomli`` (API-compatible)
 # on 3.10 so the allowlist config loads identically on both interpreters.
@@ -191,15 +207,17 @@ def http_get(url: str, raw: bool = False) -> ToolResult:
     # HTML→markdown extraction: strip navigation, scripts, and ads so the
     # model only sees the main content. Falls back to raw HTML when
     # trafilatura is not installed or extraction yields nothing.
-    if is_html and not raw and _HAS_TRAFILATURA:
-        md = _trafilatura.extract(  # type: ignore[union-attr]
-            body,
-            include_comments=False,
-            output_format="markdown",
-        )
-        if md:
-            body = md
-            extracted = True
+    if is_html and not raw:
+        traf = _load_trafilatura()
+        if traf is not None:
+            md = traf.extract(  # type: ignore[union-attr]
+                body,
+                include_comments=False,
+                output_format="markdown",
+            )
+            if md:
+                body = md
+                extracted = True
 
     return ToolResult(
         ok=True,
